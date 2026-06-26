@@ -38,6 +38,35 @@ const IDLE_STRICT = [
   '  ? for shortcuts',
 ].join('\n')
 
+// Real strict SECURITY-PROFILE footer (sub-agent launched WITHOUT
+// --dangerously-skip-permissions: researcher / developer-junior /
+// marketer). There is no "bypass permissions on" prefix; the right edge
+// shows the fixed "← for agents" navigation affordance next to a rotating
+// onboarding tip on the left. Byte-for-byte from a live `tmux capture-pane`
+// of an `agent-*` session (U+00B7 middle dot, U+2190 leftwards arrow).
+// Before the fix this read as 'unknown' and the router never delivered
+// inter-agent messages to these agents.
+const IDLE_STRICT_PROFILE = [
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  gh auth login · ← for agents',
+].join('\n')
+
+// Same strict-profile session mid-turn: the token counter is rendered and
+// the right-edge "← for agents" hint is replaced by "esc to interrupt".
+// Must classify as busy, not idle -- the arrow hint is gone the moment a
+// turn is live.
+const BUSY_STRICT_PROFILE = [
+  '✶ Pondering… (8s · ↓ 310 tokens)',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  gh auth login · esc to interrupt',
+].join('\n')
+
 const BUSY_FULL_FOOTER = [
   '✢ Combobulating… (52s · ↓ 2.6k tokens · thinking some more)',
   '',
@@ -386,6 +415,25 @@ describe('detectPaneState', () => {
 
   it('detects idle on strict-mode footer ("? for shortcuts")', () => {
     expect(detectPaneState(IDLE_STRICT)).toBe('idle')
+  })
+
+  it('detects idle on a strict security-profile footer ("← for agents")', () => {
+    // Root cause of the inter-agent stuck-pending incident: a sub-agent on
+    // a strict security profile launches WITHOUT --dangerously-skip-permissions,
+    // so its idle footer is "gh auth login · ← for agents" instead of the
+    // "bypass permissions on ..." form. The old IDLE_FOOTER_RX had no arm for
+    // it, detectPaneState returned 'unknown', and the router refused to deliver
+    // (researcher/junior/marketer agents unreachable). Now classified idle.
+    expect(detectPaneState(IDLE_STRICT_PROFILE)).toBe('idle')
+    expect(isReadyForPrompt(IDLE_STRICT_PROFILE)).toBe(true)
+  })
+
+  it('classifies a strict-profile session mid-turn as busy, not idle', () => {
+    // Guard the new "← for agents" arm against false-idle during a live
+    // turn: the arrow hint is replaced by "esc to interrupt" and the token
+    // counter is rendered, so the busy guards must win before the footer gate.
+    expect(detectPaneState(BUSY_STRICT_PROFILE)).toBe('busy')
+    expect(isReadyForPrompt(BUSY_STRICT_PROFILE)).toBe(false)
   })
 
   it('detects idle when the footer shows the multi-shell indicator', () => {
