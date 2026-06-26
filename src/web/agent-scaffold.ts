@@ -86,7 +86,45 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
     allow: profile.filesystem.allow.map(p => resolveProfilePlaceholders(p, ctx)),
     deny: profile.filesystem.deny.map(p => resolveProfilePlaceholders(p, ctx)),
   }
+  // Email-send hard-gate: every sub-agent (NOT the main agent) gets a
+  // PreToolUse hook that blocks outbound email-send tools. Re-applied on
+  // every spawn (this function regenerates settings.json), so it survives
+  // respawns. The MAIN_AGENT_ID retains email-send capability -- all outbound
+  // email routes through it for approval.
+  if (agentGetsEmailGate(name)) injectEmailSendGate(existing)
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
+}
+
+// Which agents are subject to the email-send hard-gate: every agent EXCEPT the
+// main agent (MAIN_AGENT_ID, e.g. Marveen). Name-agnostic -- keyed on the
+// configured main-agent id, not a hardcoded 'marveen', so a customer install
+// gates its own sub-agents and exempts its own owner (distribution-hardcode
+// rule). Pure + exported so the main-exempt guarantee is unit-testable.
+export function agentGetsEmailGate(name: string): boolean {
+  return name !== MAIN_AGENT_ID
+}
+
+// Idempotently wire the email-send-gate PreToolUse hook into a settings.json
+// object. A deny-list rule alone would NOT enforce this: permissive profiles
+// launch with --dangerously-skip-permissions, which bypasses allow/deny --
+// hooks run regardless of permission mode. Name-agnostic so a customer install
+// gates its own sub-agents (the caller's MAIN_AGENT_ID guard exempts the owner).
+export function injectEmailSendGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'email-send-gate.mjs')}`
+  const entry = {
+    matcher: 'Bash|send_email',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  // Drop any prior email-gate entry (respawn re-runs this) before re-adding, so
+  // the hook never accumulates duplicates; other PreToolUse entries are kept.
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('email-send-gate.mjs')),
+    entry,
+  ]
 }
 
 // Copy the repo's `scheduled-tasks/<task>/task-config.json` to the

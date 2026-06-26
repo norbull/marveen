@@ -30,6 +30,7 @@ import { CHANNEL_PROVIDER, MAIN_AGENT_ID } from '../config.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
 import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
+import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
 import { getSecret } from './vault.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
 
@@ -306,9 +307,16 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     const isClaude = model.startsWith('claude-')
     const isDeepseek = model.startsWith('deepseek-')
     const isOllama = !isClaude && !isDeepseek
-    const ollamaEnv = isOllama ? `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && ` : ''
+    // ANTHROPIC_MODEL is REQUIRED for non-Claude models: the interactive TUI
+    // validates the `--model` flag against known Anthropic models and silently
+    // falls back to the built-in default (claude-opus-...) for an unrecognized
+    // value like `qwen3.6:27b` or `deepseek-v4-pro` -- which then errors against
+    // the custom ANTHROPIC_BASE_URL ("model does not exist"). The env var is
+    // authoritative and bypasses that validation. (`--print` honors --model, but
+    // the agents run the TUI.) Single-quoted so a `:` in the tag is shell-safe.
+    const ollamaEnv = isOllama ? `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && export ANTHROPIC_MODEL='${model}' && ` : ''
     const deepseekKey = isDeepseek ? (getSecret('DEEPSEEK_API_KEY') ?? '') : ''
-    const deepseekEnv = isDeepseek ? `export ANTHROPIC_AUTH_TOKEN="${deepseekKey}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && ` : ''
+    const deepseekEnv = isDeepseek ? `export ANTHROPIC_AUTH_TOKEN="${deepseekKey}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && export ANTHROPIC_MODEL='${model}' && ` : ''
     // When authMode is 'api', the agent uses its own ANTHROPIC_API_KEY from
     // the vault instead of the host's OAuth. The vault entry ID follows the
     // convention `agent-{name}-api-key`. We inject it as an env var so Claude
@@ -401,9 +409,24 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
       ? `export ${stateEnvVar}="${agentChannelDir}"${auditLogEnv} && `
       : ''
     const channelFlag = hasChannel ? `--channels plugin:${provider.pluginId}` : ''
+    // Channel-plugin MCP-registration guard (2026-06-23): the telegram/slack/etc.
+    // channel plugin registers as a stdio MCP server loaded via --channels. Claude
+    // Code connects stdio MCP servers in batches of MCP_SERVER_CONNECTION_BATCH_SIZE
+    // (default 3); when an agent ALSO runs a slow local .mcp.json stdio server
+    // (e.g. google-workspace/workspace-mcp, which spends seconds on OAuth + Google
+    // API init) plus many claude.ai connectors, the channel plugin gets starved
+    // out of the startup batch / hits MCP_TIMEOUT and never registers -- no /mcp
+    // entry, no bun poller, dead bot (observed: balazsmarveenja with workspace-mcp
+    // had NO telegram; removing workspace-mcp restored it). Raise the stdio batch
+    // size and per-server timeout, and force non-blocking startup, so a slow local
+    // MCP can never crowd the channel plugin out of registration. Only set for
+    // channel-having agents (channel-less agents have no plugin to protect).
+    const mcpEnv = hasChannel
+      ? 'export MCP_SERVER_CONNECTION_BATCH_SIZE=10 && export MCP_CONNECTION_NONBLOCKING=1 && export MCP_TIMEOUT=60000 && '
+      : ''
     // Single-quote `${model}` so values like `claude-opus-4-8[1m]` (1M-context
     // suffix) are not glob-expanded by the shell that tmux spawns the command in.
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${channelSetup}${apiKeyEnv}${claudeConfigEnv}${ollamaEnv}${deepseekEnv}cd "${dir}" && ${CLAUDE} ${continueFlag}${skipFlag}--model '${model}' ${channelFlag}`.trimEnd()
+    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${ollamaEnv}${deepseekEnv}cd "${dir}" && ${CLAUDE} ${continueFlag}${skipFlag}--model '${model}' ${channelFlag}`.trimEnd()
     runTmux(null, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
 
     logger.info({ name, session, channelDir: agentChannelDir }, 'Agent tmux session started')
@@ -423,6 +446,21 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // sessions can also be present, so dismiss both. Errors are swallowed
     // -- the outbound pre-flight remains the safety net if this misses.
     scheduleIdentitySetup(session, readAgentDisplayName(name))
+
+    // Colleague auto-unlock (2026-06-22): mirror the main session's
+    // post-respawn unlock probe for channel-having sub-agents. After a restart
+    // the bun channel poller sometimes never attaches during the cold-start
+    // window (observed fleet-wide after a managed restart: the TUI comes up but
+    // bot.pid stays empty, so the agent goes deaf to inbound). The main session
+    // self-heals because channel-monitor schedules schedulePluginUnlockAfterRespawn;
+    // sub-agents had no such probe and stayed stuck until a manual /mcp kick.
+    // Schedule the same probe here. It is gated on bun-absence (a healthy poller
+    // is left untouched) and on an idle pane, so it never disturbs a colleague
+    // mid-turn. Channel-less agents (hasChannel false) get no probe; MAIN never
+    // takes this path (it comes up via channels.sh) but guard defensively.
+    if (hasChannel && name !== MAIN_AGENT_ID) {
+      schedulePluginUnlockAfterRespawn(session, provider.type)
+    }
 
     return { ok: true }
   } catch (err) {

@@ -21,10 +21,13 @@
 
 export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 
-// Claude Code shows the footer in one of two modes: the default "bypass"
-// permissions mode (permissive) and the "strict" mode. Both are "idle"
-// surfaces. If neither is visible the pane is not a recognised Claude
-// Code surface and we report 'unknown' rather than guess.
+// Claude Code shows the footer in one of two permission modes: the
+// default "bypass" permissions mode (permissive, launched with
+// --dangerously-skip-permissions) and the "strict" mode (a sub-agent on
+// a strict security profile -- researcher / developer-junior / marketer --
+// launched WITHOUT that flag so the native allow/deny engine governs).
+// Both are "idle" surfaces. If neither is visible the pane is not a
+// recognised Claude Code surface and we report 'unknown' rather than guess.
 //
 // The bypass-mode footer has known trailing variants after the
 // "bypass permissions on" prefix: the original "(shift+tab to cycle)"
@@ -47,7 +50,20 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 //       happens to contain "bypass permissions on · 1 shell" verbatim
 //       (an echoed log line, a quoted message, etc.) which would
 //       otherwise be misread as idle.
-const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · \d+ shells? · (?:ctrl\+t|↓ to manage))|\? for shortcuts/
+//
+// The strict-mode footer has NO "bypass permissions on" prefix (that
+// string is exclusive to the skip-permissions launch). Its right edge
+// shows the "← for agents" navigation affordance -- a FIXED hint present
+// whenever the pane is at the idle prompt, NOT one of the rotating
+// onboarding tips on the left (`gh auth login`, `Try ...`). A live turn
+// replaces that right-edge hint with `esc to interrupt`, so its presence
+// is an idle signal. Without this arm a strict-profile sub-agent's footer
+// (`gh auth login · ← for agents`) read as 'unknown', the router never
+// saw it as idle, and inter-agent messages to it stuck pending forever
+// (researcher/junior/marketer agents could not be reached at all). The
+// whitespace between the arrow and "for agents" is matched with
+// `[^\S\r\n]+` for the same NBSP/variable-space tolerance as PARKED_INPUT_RX.
+const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · \d+ shells? · (?:ctrl\+t|↓ to manage))|\? for shortcuts|←[^\S\r\n]+for agents/
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
 // is mid-flight, even if the footer looks idle for a frame.
@@ -174,11 +190,22 @@ export function detectsPastePlaceholder(pane: string): boolean {
 // HORIZONTAL. At least 10 in a run to ignore stray `-` glyphs.
 const BOX_SEP_RX = /^─{10,}/
 
-// Prompt line inside the input box. `❯` followed by at least one tab/
-// space and then a non-whitespace character means the user (or a
-// send-keys that didn't submit) parked text there. Single-line match
-// ([ \t] not \s) to avoid crossing into the next line.
-const PARKED_INPUT_RX = /❯[ \t]+\S/
+// Prompt line inside the input box. `❯` followed by at least one
+// horizontal whitespace and then a non-whitespace character means the
+// user (or a send-keys that didn't submit) parked text there.
+//
+// The class is `[^\S\r\n]` (any whitespace EXCEPT a line break), not
+// `[ \t]`: a live Claude Code pane renders the gap after the ❯ prompt
+// glyph as a NON-BREAKING SPACE (U+00A0), not an ASCII space, while a
+// message sits parked (delivered but not yet submitted). The ASCII-space
+// form only appears in scrollback for already-submitted lines. `[ \t]`
+// missed that NBSP, so an NBSP-rendered parked box read as 'idle' and the
+// whole stuck-input recovery chain (stuckInputSignature, parkedChannelInput,
+// parkedInputText all gate on detectPaneState === 'typing') never fired --
+// the message stranded forever. Excluding only \r\n keeps the original
+// single-line intent (the match must not cross into the next line) while
+// admitting the NBSP and any other horizontal Unicode space the TUI emits.
+const PARKED_INPUT_RX = /❯[^\S\r\n]+\S/
 
 // Persistent Anthropic thinking-block API error. When an assistant turn
 // ends with a 400 about thinking/redacted_thinking blocks that "cannot
