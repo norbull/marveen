@@ -243,7 +243,7 @@ function startRemoteAgentProcess(
   }
 }
 
-export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}): { ok: boolean; pid?: number; error?: string } {
+export function startAgentProcess(name: string, opts: { fresh?: boolean; skipIdentitySetup?: boolean } = {}): { ok: boolean; pid?: number; error?: string } {
   const dir = agentDir(name)
   if (!existsSync(dir)) return { ok: false, error: 'Agent not found' }
 
@@ -445,7 +445,9 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // typically appears within 4-6s). Survey-rating modals from prior
     // sessions can also be present, so dismiss both. Errors are swallowed
     // -- the outbound pre-flight remains the safety net if this misses.
-    scheduleIdentitySetup(session, readAgentDisplayName(name))
+    if (!opts.skipIdentitySetup) {
+      scheduleIdentitySetup(session, readAgentDisplayName(name))
+    }
 
     // Colleague auto-unlock (2026-06-22): mirror the main session's
     // post-respawn unlock probe for channel-having sub-agents. After a restart
