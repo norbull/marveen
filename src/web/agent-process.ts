@@ -579,13 +579,40 @@ export function identitySlashCommands(displayName: string): string[] {
 // reliably ready ~5s after that.
 const MODAL_DISMISS_DELAY_MS = 8000
 const IDENTITY_SEND_DELAY_MS = 5000
+// How long to wait between idle-check retries before giving up on /name.
+const IDENTITY_IDLE_RETRY_MS = 5000
+const IDENTITY_IDLE_MAX_ATTEMPTS = 24 // up to 2 minutes
+
+// Wait until pane is idle before sending `/name`, then retry on each tick.
+// A large --continue load can take 30-60s; sending /name into a busy pane
+// drops a slash-command into the input mid-turn and interrupts the agent.
+function sendNameWhenIdle(session: string, displayName: string, host: string | null, attempt: number): void {
+  if (attempt >= IDENTITY_IDLE_MAX_ATTEMPTS) {
+    logger.warn({ session, displayName }, 'Identity /name setup: pane never went idle, giving up')
+    return
+  }
+  const pane = capturePane(session, host)
+  if (pane == null) return // session gone
+  if (!paneLooksIdle(pane)) {
+    setTimeout(() => sendNameWhenIdle(session, displayName, host, attempt + 1), IDENTITY_IDLE_RETRY_MS)
+    return
+  }
+  try {
+    for (const cmd of identitySlashCommands(displayName)) {
+      runTmux(host, ['send-keys', '-t', session, cmd, 'Enter'], { timeout: 5000 })
+      execFileSync('/bin/sleep', ['1'], { timeout: 2000 })
+    }
+    logger.info({ session, displayName }, 'Set session /name')
+  } catch (err) {
+    logger.warn({ err, session, displayName }, 'Failed to set session /name')
+  }
+}
 
 // Schedule the identity setup for a freshly (re)spawned session: once it has
-// had time to render, dismiss any first-run/resume modals, then send `/name`.
-// Shared by startAgentProcess and the channel-monitor recovery respawns
-// (resumeMarveenSession / respawnMarveenSessionFresh), which previously left the
-// main session without its identity after auto-recovery. Fire-and-forget; all
-// errors are swallowed/logged so a missed setup never tears down the caller.
+// had time to render, dismiss any first-run/resume modals, then send `/name`
+// only after the pane is idle (so a long --continue load does not get
+// interrupted mid-turn). Shared by startAgentProcess and the channel-monitor
+// recovery respawns. Fire-and-forget; errors are swallowed/logged.
 export function scheduleIdentitySetup(session: string, displayName: string, host: string | null = null): void {
   setTimeout(() => {
     try {
@@ -594,17 +621,7 @@ export function scheduleIdentitySetup(session: string, displayName: string, host
     } catch (err) {
       logger.warn({ err, session }, 'Post-restart modal dismiss failed')
     }
-    setTimeout(() => {
-      try {
-        for (const cmd of identitySlashCommands(displayName)) {
-          runTmux(host, ['send-keys', '-t', session, cmd, 'Enter'], { timeout: 5000 })
-          execFileSync('/bin/sleep', ['1'], { timeout: 2000 })
-        }
-        logger.info({ session, displayName }, 'Set session /name')
-      } catch (err) {
-        logger.warn({ err, session, displayName }, 'Failed to set session /name')
-      }
-    }, IDENTITY_SEND_DELAY_MS)
+    setTimeout(() => sendNameWhenIdle(session, displayName, host, 0), IDENTITY_SEND_DELAY_MS)
   }, MODAL_DISMISS_DELAY_MS)
 }
 
