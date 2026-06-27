@@ -111,9 +111,12 @@ MODEL_FLAG=""
 # Full PATH with .bun/bin -- without it the respawned bun telegram bridge does
 # not come up and the session is channel-less.
 CHANNEL_PATH='export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"'
-RESPAWN_CMD="$CHANNEL_PATH && $CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:telegram@claude-plugins-official"
-# Full restart keeps Orin's conversation context: --continue is mandatory.
-FULL_RESTART_CMD="$CHANNEL_PATH && $CLAUDE --continue --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:telegram@claude-plugins-official"
+# Both stages launch with --continue so the main agent's (Orin's) conversation
+# context survives recovery. A fresh respawn WITHOUT --continue restores the bun
+# bridge but silently replaces the running agent with a context-less session
+# (observed live 2026-06-27: the channel came back healthy but "Orin disappeared").
+# So --continue is mandatory on BOTH the cheap respawn and the full restart.
+LAUNCH_CMD="$CHANNEL_PATH && $CLAUDE --continue --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:telegram@claude-plugins-official"
 
 # --- gate: session must exist ---------------------------------------------
 if ! "$TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; then
@@ -150,7 +153,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   log "[DRY-RUN] would respawn-pane $SESSION (respawn #$((respawn_count+1))), wait ${VERIFY_GRACE}s, verify"
 else
   log "stage 1: respawn-pane $SESSION (respawn #$((respawn_count+1)))"
-  if "$TMUX_BIN" respawn-pane -k -t "$SESSION" "$RESPAWN_CMD" 2>/dev/null; then
+  if "$TMUX_BIN" respawn-pane -k -t "$SESSION" "$LAUNCH_CMD" 2>/dev/null; then
     date +%s > "$RESPAWN_STAMP"
     echo $(( respawn_count + 1 )) > "$RESPAWN_COUNT_FILE"
   else
@@ -196,7 +199,7 @@ fi
 log "stage 2: full restart $SESSION (kill-session + new-session --continue)"
 "$TMUX_BIN" kill-session -t "$SESSION" 2>/dev/null || true
 sleep 1
-if ! "$TMUX_BIN" new-session -d -s "$SESSION" -c "$INSTALL_DIR" "$FULL_RESTART_CMD" 2>/dev/null; then
+if ! "$TMUX_BIN" new-session -d -s "$SESSION" -c "$INSTALL_DIR" "$LAUNCH_CMD" 2>/dev/null; then
   log "full restart: new-session FAILED for $SESSION"
   exit "$EXIT_FAILED"
 fi
