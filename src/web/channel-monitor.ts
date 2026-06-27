@@ -1064,7 +1064,10 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
         try {
           stopAgentProcess(t.agentName!)
           execSync('sleep 2', { timeout: 4000 })
-          startAgentProcess(t.agentName!)
+          // skipIdentitySetup: the agent resumes via --continue so it already
+          // has its identity from conversation context; injecting /name into a
+          // recovering pane interrupts work without adding value.
+          startAgentProcess(t.agentName!, { skipIdentitySetup: true })
           agentLastRestart.set(t.agentName!, Date.now())
           agentDownSince.delete(t.session)
           // Count this restart as failed until a later sweep sees the plugin
