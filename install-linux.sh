@@ -1134,6 +1134,11 @@ WorkingDirectory=$INSTALL_DIR
 ExecStart=$NODE_PATH $INSTALL_DIR/dist/index.js
 Restart=on-failure
 RestartSec=5
+# Raise the file-descriptor limit: the dashboard makes many tmux subprocess
+# calls + holds MCP/SSE connections; the default soft limit (often 1024, or 256
+# under launchd on macOS) is exhausted once enough agents are active -> EMFILE,
+# silent HTTP-listener flap + "can't find session" tmux failures (2026-06-27).
+LimitNOFILE=16384
 StandardOutput=append:$INSTALL_DIR/store/dashboard.log
 StandardError=append:$INSTALL_DIR/store/dashboard.error.log
 Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
@@ -1152,6 +1157,13 @@ After=network.target
 
 [Service]
 Type=simple
+# KillMode=process: the first tmux new-session from channels.sh starts the
+# SHARED tmux server in this unit's cgroup, and every sub-agent session lives
+# there too. Default control-group mode would SIGKILL the whole fleet on a
+# stop/restart (only the main agent's own unit). process mode kills only
+# channels.sh; the tmux server and all agents survive. channels.sh kill-sessions
+# its own "\$SESSION" before new-session so the surviving session doesn't collide.
+KillMode=process
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/scripts/channels.sh
 Restart=on-failure

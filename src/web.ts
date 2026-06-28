@@ -2,13 +2,13 @@ import http from 'node:http'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync, execFileSync } from 'node:child_process'
-import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS } from './config.js'
+import { PROJECT_ROOT, WEB_HOST, DASHBOARD_PUBLIC_URL, DASHBOARD_ALLOWED_ORIGINS, MAIN_AGENT_ID } from './config.js'
 import { loadOrCreateDashboardToken, checkBearerToken } from './web/dashboard-auth.js'
 import { isBlockedCrossOriginWrite } from './web/csrf-origin.js'
 import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
-import { ensureAgentHooks, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureAgentStalenessHook, ensureDefaultScheduledTasks } from './web/agent-scaffold.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
 import { startUpdateChecker } from './web/update-checker.js'
@@ -52,6 +52,7 @@ import { tryHandleToolLog } from './web/routes/tool-log.js'
 import { tryHandleSettings } from './web/routes/settings.js'
 import { tryHandleAuditLog } from './web/routes/audit-log.js'
 import { tryHandleStatic } from './web/routes/static.js'
+import { tryHandleVoice } from './web/routes/voice.js'
 import type { RouteContext } from './web/routes/types.js'
 
 const WEB_DIR = join(PROJECT_ROOT, 'web')
@@ -168,6 +169,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleIdeas(routeCtx)) return
       if (await tryHandleToolLog(routeCtx)) return
       if (await tryHandleSettings(routeCtx)) return
+      if (await tryHandleVoice(routeCtx)) return
       if (await tryHandleAuditLog(routeCtx)) return
       if (await tryHandleStatic(routeCtx, WEB_DIR)) return
 
@@ -220,7 +222,9 @@ export function startWebServer(port = 3420): http.Server {
                 try { process.kill(pid, 'SIGKILL') } catch { /* gone */ }
               } catch { /* gone */ }
             }
-            server.listen(port)
+            server.listen(port, WEB_HOST, () => {
+              logger.info({ port }, `Web dashboard: re-listen bound after port reclaim`)
+            })
           }, 1500)
         } else {
           logger.error({ port }, 'Port foglalt de nem talaltunk felszabadithato node processt -- kilepes')
@@ -246,59 +250,98 @@ export function startWebServer(port = 3420): http.Server {
     )
   })
 
-  const routerInterval = startMessageRouter()
-  logger.info('Agent message router started (5s poll)')
+  // Self-heal a SILENT listener failure. Under launchd, a `kickstart -k` can
+  // race the dying predecessor's lingering socket: the EADDRINUSE reclaim +
+  // re-listen path can leave this process ALIVE but not actually listening, with
+  // no error (observed 2026-06-27 -- the success log above fired yet nothing was
+  // bound, and the background loops started below kept running, so the dashboard
+  // was deaf until a manual restart, which bound cleanly). A clean restart binds
+  // reliably, so if the listener is not up we exit(1) and let launchd restart us
+  // fresh rather than linger un-servable. Runs regardless of WEB_ONLY -- it is
+  // about the HTTP listener, not the background services.
+  //
+  // The grace must comfortably exceed a SLOW-but-valid bind: restarting OVER a
+  // wedged predecessor, the EADDRINUSE reclaim retries every ~1500ms until the
+  // old socket finally releases -- observed up to ~5 MINUTES (2026-06-27). An
+  // 8s grace would exit MID-bind and loop, so wait STARTUP_GRACE first. After
+  // that, poll periodically so a mid-life listener drop is caught too, not just
+  // a startup failure.
+  const STARTUP_GRACE_MS = 7 * 60 * 1000
+  const RELISTEN_POLL_MS = 60 * 1000
+  setTimeout(() => {
+    setInterval(() => {
+      if (!server.listening) {
+        logger.error({ port }, 'Web server not listening -- exiting(1) for a clean launchd restart')
+        process.exit(1)
+      }
+    }, RELISTEN_POLL_MS).unref()
+  }, STARTUP_GRACE_MS).unref()
 
-  const scheduleInterval = startScheduleRunner()
-  logger.info('Schedule runner started (60s poll)')
+  // WEB_ONLY=true disables all background services (scheduler, pollers, monitors).
+  // Used for staging preview instances that must not conflict with the live fleet
+  // (duplicate schedule execution, Telegram 409, tmux manipulation, etc.).
+  const webOnly = process.env['WEB_ONLY'] === 'true'
+  if (webOnly) {
+    logger.info('[staging] WEB_ONLY mode: background services disabled')
+  }
+
+  const routerInterval = webOnly ? undefined : startMessageRouter()
+  if (!webOnly) logger.info('Agent message router started (5s poll)')
+
+  const scheduleInterval = webOnly ? undefined : startScheduleRunner()
+  if (!webOnly) logger.info('Schedule runner started (60s poll)')
 
   // Pre-start the interactive agent worker (subscription backend) so the first
   // heartbeat / scheduled generation after boot does not pay the cold-boot
   // latency. runViaWorker still lazy-starts + restarts it on demand, so this is
   // a warm-up, not a hard dependency. Skipped on the SDK rollback backend.
-  if ((process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() !== 'sdk') {
+  if (!webOnly && (process.env.MARVEEN_AGENT_BACKEND || 'worker').toLowerCase() !== 'sdk') {
     import('./web/agent-worker.js')
       .then(m => { m.startWorkerSession(); logger.info('Interactive agent worker pre-started') })
       .catch(err => logger.warn({ err }, 'Failed to pre-start agent worker (will lazy-start on first use)'))
   }
 
-  const pluginMonitorInterval = startChannelPluginMonitor()
-  logger.info('Channel plugin health monitor started (60s poll)')
+  const pluginMonitorInterval = webOnly ? undefined : startChannelPluginMonitor()
+  if (!webOnly) logger.info('Channel plugin health monitor started (60s poll)')
 
   // Userbot inbound-probe (gold-standard deafness detector). Safe no-op until
   // the prober session file + allowlist are configured. Wrapped so a failure
   // never crashes server startup.
-  try {
-    startInboundProber()
-  } catch (err) {
-    logger.warn({ err }, 'Inbound prober failed to start')
+  if (!webOnly) {
+    try {
+      startInboundProber()
+    } catch (err) {
+      logger.warn({ err }, 'Inbound prober failed to start')
+    }
   }
 
-  const channelHealthInterval = startChannelHealthMonitor()
-  logger.info('Channel MCP health monitor started (60s poll, 45s offset)')
+  const channelHealthInterval = webOnly ? undefined : startChannelHealthMonitor()
+  if (!webOnly) logger.info('Channel MCP health monitor started (60s poll, 45s offset)')
 
-  const stuckInputInterval = startStuckInputWatcher()
-  logger.info('Stuck-input watcher started (15s poll, 20s offset)')
+  const stuckInputInterval = webOnly ? undefined : startStuckInputWatcher()
+  if (!webOnly) logger.info('Stuck-input watcher started (15s poll, 20s offset)')
 
-  const stuckToolCallInterval = startStuckToolCallWatcher()
-  logger.info('Stuck-tool-call watcher started (30s poll, 35s offset)')
+  const stuckToolCallInterval = webOnly ? undefined : startStuckToolCallWatcher()
+  if (!webOnly) logger.info('Stuck-tool-call watcher started (30s poll, 35s offset)')
 
-  const reauthHealerInterval = startReauthHealer()
-  if (reauthHealerInterval) logger.info('Reauth healer started (3min poll, 90s offset)')
+  const reauthHealerInterval = webOnly ? undefined : startReauthHealer()
+  if (!webOnly && reauthHealerInterval) logger.info('Reauth healer started (3min poll, 90s offset)')
 
-  const autoRestartInterval = startAutoRestartRunner()
-  logger.info('Auto-restart runner started (60s poll, 40s offset)')
+  const autoRestartInterval = webOnly ? undefined : startAutoRestartRunner()
+  if (!webOnly) logger.info('Auto-restart runner started (60s poll, 40s offset)')
 
-  const updateCheckerInterval = startUpdateChecker()
-  logger.info('Update checker started (15min poll)')
+  const updateCheckerInterval = webOnly ? undefined : startUpdateChecker()
+  if (!webOnly) logger.info('Update checker started (15min poll)')
 
   // Collect token usage from JSONL transcripts every hour so the run-history
   // token estimates stay fresh without requiring a manual dashboard visit.
-  const tokenCollectInterval = setInterval(() => {
+  const tokenCollectInterval = webOnly ? undefined : setInterval(() => {
     collectTokenUsage().catch(err => logger.warn({ err }, 'Periodic token usage collection failed'))
   }, 60 * 60 * 1000)
-  collectTokenUsage().catch(err => logger.warn({ err }, 'Startup token usage collection failed'))
-  logger.info('Token usage auto-collect started (1h poll + startup)')
+  if (!webOnly) {
+    collectTokenUsage().catch(err => logger.warn({ err }, 'Startup token usage collection failed'))
+    logger.info('Token usage auto-collect started (1h poll + startup)')
+  }
 
   // NOTE: startMcpListChecker() is intentionally NOT called here.
   //
@@ -325,10 +368,15 @@ export function startWebServer(port = 3420): http.Server {
   // agent already has its own hooks block.
   try {
     const patched: string[] = []
-    for (const agentName of listAgentNames()) {
+    const stalePatched: string[] = []
+    // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
+    // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
+    for (const agentName of [MAIN_AGENT_ID, ...listAgentNames()]) {
       if (ensureAgentHooks(agentName)) patched.push(agentName)
+      if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
     }
     if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
+    if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
   } catch (err) {
     logger.warn({ err }, 'Agent hook backfill skipped')
   }

@@ -807,6 +807,16 @@ cat > "$PLIST_DIR/${DASHBOARD_PLIST}.plist" << PLISTEOF
     <key>HOME</key>
     <string>${HOME}</string>
   </dict>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>16384</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>32768</integer>
+  </dict>
 </dict>
 </plist>
 PLISTEOF
