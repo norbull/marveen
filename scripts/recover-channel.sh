@@ -101,6 +101,22 @@ verify_healthy() {
   "$VERIFY" >/dev/null 2>&1
 }
 
+# --- direct Telegram alert (dashboard-independent) ------------------------
+# Used for the staleness-takeover path (Nova #3): when this script takes over
+# because the dashboard is dead, the dashboard /api/messages route is down too,
+# so we notify Norbi straight from the bot token. Best-effort, never fails the run.
+alert_norbi() {
+  local msg="$1"
+  local tg_env="$HOME/.claude/channels/telegram/.env"
+  [ -f "$tg_env" ] || return 0
+  local token chat
+  token="$(grep '^TELEGRAM_BOT_TOKEN=' "$tg_env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')"
+  chat="$(grep '^ALLOWED_CHAT_ID=' "$INSTALL_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')"
+  [ -z "$token" ] || [ -z "$chat" ] && return 0
+  curl -s --max-time 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+    -d "chat_id=${chat}" --data-urlencode "text=${msg}" >/dev/null 2>&1 || true
+}
+
 # --- build the claude launch command (respawn and full-restart variants) ---
 MAIN_MODEL=""
 if [ -f "$INSTALL_DIR/.claude/settings.json" ] && command -v jq >/dev/null 2>&1; then
@@ -117,6 +133,12 @@ CHANNEL_PATH='export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.lin
 # (observed live 2026-06-27: the channel came back healthy but "Orin disappeared").
 # So --continue is mandatory on BOTH the cheap respawn and the full restart.
 LAUNCH_CMD="$CHANNEL_PATH && $CLAUDE --continue --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:telegram@claude-plugins-official"
+# Stage-3 FALLBACK launch: FRESH (NO --continue). On CC 2.1.193 a --continue resume
+# can come up without the channels plugin (deaf channel). A deaf telegram is WORSE
+# than lost context, so the last resort sacrifices conversation context (memory
+# persists) to guarantee a reachable channel. Used ONLY on the stage-2 verify-fail
+# path -- mirrors upstream shouldEscalateAfterResume.
+FRESH_CMD="$CHANNEL_PATH && $CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:telegram@claude-plugins-official"
 
 # --- gate: session must exist ---------------------------------------------
 if ! "$TMUX_BIN" has-session -t "$SESSION" 2>/dev/null; then
@@ -129,6 +151,46 @@ if verify_healthy; then
   log "session $SESSION already healthy -- nothing to do"
   [ "$DRY_RUN" -eq 0 ] && rm -f "$RESPAWN_COUNT_FILE" "$FULL_RESTART_FILE" 2>/dev/null || true
   exit "$EXIT_RECOVERED"
+fi
+
+# --- single-owner ownership guard (team decision 2026-06-28) --------------
+# While the dashboard process is alive, the in-process channel-monitor.ts owns
+# main-session recovery (resumeMarveenSession --continue + the post-resume plugin
+# guard that escalates to a fresh respawn on the CC 2.1.193 regression). This
+# script is the DASHBOARD-DEAD fallback (systemd timer). Running both against the
+# same session double-restarts and flaps, so we yield while the owner is up.
+#
+# Ownership is decided by the OWNER'S LIVENESS (its pid), NOT by stamp freshness:
+# a fresh stamp can be a dead owner's last write. The shared stamp
+# (store/.channel-last-respawn, written by both sides) is only anti-double-action
+# coordination, not the ownership decision.
+DASHBOARD_PID_FILE="$STORE/claudeclaw.pid"
+STALENESS_TIMEOUT="${STALENESS_TIMEOUT:-300}"
+dashboard_alive() {
+  [ -f "$DASHBOARD_PID_FILE" ] || return 1
+  local pid; pid="$(cat "$DASHBOARD_PID_FILE" 2>/dev/null)"
+  case "$pid" in (*[!0-9]*|'') return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
+if [ "$DRY_RUN" -eq 0 ] && dashboard_alive; then
+  log "dashboard alive -- channel-monitor.ts owns main-session recovery; deferring"
+  exit "$EXIT_DEFERRED"
+fi
+# Dashboard dead -> this script is the owner. Handoff-deadlock guard (Nova #1):
+# if the dashboard died MID-RESPAWN the stamp is fresh; defer one bounded cycle in
+# case it comes back, then take over so the channel cannot stay down forever.
+if [ "$DRY_RUN" -eq 0 ] && [ -f "$RESPAWN_STAMP" ]; then
+  _last="$(cat "$RESPAWN_STAMP" 2>/dev/null || echo 0)"
+  case "$_last" in (*[!0-9]*|'') _last=0 ;; esac
+  if [ $(( now - _last )) -lt "$STALENESS_TIMEOUT" ]; then
+    log "dashboard dead but respawn-stamp fresh ($(( now - _last ))s < ${STALENESS_TIMEOUT}s) -- possible mid-respawn death; deferring one cycle"
+    exit "$EXIT_DEFERRED"
+  fi
+  # Nova #3: a staleness takeover means the dashboard died abnormally (mid-respawn
+  # or worse). Never silent -- log at ALERT level AND notify Norbi directly, since
+  # the dashboard API is down. Repeated takeovers signal an unstable dashboard.
+  log "ALERT: dashboard dead + respawn-stamp stale (>${STALENESS_TIMEOUT}s) -- taking over $SESSION recovery as fallback owner (dashboard may be unstable)"
+  alert_norbi "recover-channel.sh: a dashboard halott es a respawn-stamp elavult -- a watchdog ATVESZI a $SESSION helyreallitast. A dashboard valoszinuleg instabil, erdemes megnezni."
 fi
 
 # --- rate-limit / interactive prompt = SYSTEMIC, not a disconnect ----------
@@ -213,5 +275,49 @@ if verify_healthy; then
   rm -f "$RESPAWN_COUNT_FILE" 2>/dev/null || true
   exit "$EXIT_RECOVERED"
 fi
-log "full restart: FAIL -- still unhealthy"
+log "full restart (--continue): FAIL -- escalating to stage 3 (FRESH restart)"
+
+# --- stage 3: FRESH full restart (last resort, context sacrificed) ---------
+# Iris spec 8.6: only reached when the --continue restart verify failed, i.e. the
+# resumed session still has no working channel plugin (CC 2.1.193). Drop --continue
+# to force a clean plugin load. Context is lost; memory persists.
+#
+# Idle-guard again (Nova): a FRESH kill-session is the most destructive step.
+PANE_TAIL3="$("$TMUX_BIN" capture-pane -p -t "$SESSION" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -8)"
+if echo "$PANE_TAIL3" | grep -qiE 'esc to interrupt|[✻✶✳✷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]'; then
+  log "deferred: pane busy before FRESH restart -- not sacrificing context now"
+  exit "$EXIT_DEFERRED"
+fi
+# Shared full-restart cap covers BOTH stage 2 and stage 3 (Iris): this stage-3
+# attempt counts against MAX_FULL_RESTARTS too. Re-check before acting.
+recent_full3=0
+if [ -f "$FULL_RESTART_FILE" ]; then
+  while IFS= read -r ts; do
+    case "$ts" in (*[!0-9]*|'') continue ;; esac
+    [ $(( now - ts )) -lt "$FULL_RESTART_WINDOW" ] && recent_full3=$(( recent_full3 + 1 ))
+  done < "$FULL_RESTART_FILE"
+fi
+if [ "$recent_full3" -ge "$MAX_FULL_RESTARTS" ]; then
+  log "SYSTEMIC: full-restart cap reached, NOT attempting FRESH restart -- escalate"
+  exit "$EXIT_SYSTEMIC"
+fi
+
+log "escalate: FRESH restart (context sacrificed) -- kill-session + new-session (no --continue)"
+"$TMUX_BIN" kill-session -t "$SESSION" 2>/dev/null || true
+sleep 1
+if ! "$TMUX_BIN" new-session -d -s "$SESSION" -c "$INSTALL_DIR" "$FRESH_CMD" 2>/dev/null; then
+  log "FRESH restart: new-session FAILED for $SESSION"
+  exit "$EXIT_FAILED"
+fi
+echo "$now" >> "$FULL_RESTART_FILE"
+date +%s > "$RESPAWN_STAMP"
+
+# Fresh boot is slower than a --continue resume (~1.5x grace).
+sleep $(( FULL_RESTART_GRACE * 3 / 2 ))
+if verify_healthy; then
+  log "FRESH restart: PASS -- recovered (context sacrificed, memory persists)"
+  rm -f "$RESPAWN_COUNT_FILE" 2>/dev/null || true
+  exit "$EXIT_RECOVERED"
+fi
+log "FRESH restart: FAIL -- still unhealthy after last resort"
 exit "$EXIT_FAILED"
