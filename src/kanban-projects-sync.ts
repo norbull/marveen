@@ -195,3 +195,4 @@ export function stopKanbanProjectsSync(): void {
 
 // Re-export for the (future) live client + index boot wiring.
 export type { KanbanCard }
+export type { SyncFields }
