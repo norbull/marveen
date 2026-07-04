@@ -30,7 +30,7 @@ import {
 } from './ssh-tmux.js'
 import { parseTelegramToken } from './telegram.js'
 import { getProvider, getProviderType, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
-import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR } from '../config.js'
+import { CHANNEL_PROVIDER, MAIN_AGENT_ID, PROJECT_ROOT, STORE_DIR } from '../config.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
 import { writeAgentSettingsFromProfile } from './agent-scaffold.js'
@@ -97,6 +97,15 @@ export function ownChannelProviderForScope(
   resolvedProvider: string | null,
 ): string | null {
   return hasOwnToken && resolvedProvider ? resolvedProvider : null
+}
+
+export function buildTelegramMcpServerConfig(bunBin: string, pluginDir: string, stateDir: string) {
+  const wrapper = join(PROJECT_ROOT, 'scripts', 'channel-inbound-tee.mjs')
+  return {
+    command: 'node',
+    args: [wrapper, bunBin, 'run', '--cwd', pluginDir, '--shell=bun', '--silent', 'start'],
+    env: { TELEGRAM_STATE_DIR: stateDir },
+  }
 }
 
 // The fleet's shared long-lived OAuth token (from `claude setup-token`), stored
@@ -637,8 +646,11 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean; skipIde
     // "already in use" and ends up with No MCP servers configured -- no bun, no
     // bot.pid, deaf to inbound Telegram messages. The mcp.json path bypasses the
     // lock entirely: Claude Code spawns a fresh bun stdio server per agent, each
-    // with its own TELEGRAM_STATE_DIR (and thus its own bot token). This makes
-    // the plugin self-healing on every restart: no unlock probe needed, no race.
+    // with its own TELEGRAM_STATE_DIR (and thus its own bot token). The stdio
+    // tee wrapper restores inbound delivery by persisting channel notifications
+    // to a local inbox that the UserPromptSubmit drain hook pulls into context.
+    // This makes the plugin self-healing on every restart: no unlock probe
+    // needed, no in_use race.
     let useMcpJsonForChannel = false
     if (hasChannel && agentProvider === 'telegram' && name !== MAIN_AGENT_ID) {
       try {
@@ -655,11 +667,7 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean; skipIde
         const mcpJsonPath = join(agentDir(name), '.mcp.json')
         const mcpConfig = {
           mcpServers: {
-            'plugin:telegram:telegram': {
-              command: bunBin,
-              args: ['run', '--cwd', pluginDir, '--shell=bun', '--silent', 'start'],
-              env: { TELEGRAM_STATE_DIR: agentChannelDir },
-            },
+            'plugin:telegram:telegram': buildTelegramMcpServerConfig(bunBin, pluginDir, agentChannelDir),
           },
         }
         writeFileSync(mcpJsonPath, JSON.stringify(mcpConfig, null, 2))
@@ -1481,4 +1489,3 @@ export function clearStaleParkedInput(session: string, host: string | null = nul
   logger.warn({ session, parked: parked.slice(0, 60) }, 'message-router: cleared stale parked input (channel un-wedge)')
   return true
 }
-
