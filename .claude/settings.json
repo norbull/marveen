@@ -14,6 +14,15 @@
             "timeout": 15
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/inbox-drain.py\"",
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PostToolUse": [
