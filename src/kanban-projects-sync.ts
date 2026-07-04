@@ -17,6 +17,7 @@
 
 import {
   drainKanbanOutbox, deleteKanbanOutboxRow,
+  backfillKanbanSyncOutbox,
   getKanbanCard, createKanbanCard, updateKanbanCard,
   getKanbanSyncState, upsertKanbanSyncState, deleteKanbanSyncState, listKanbanSyncStates,
   setKanbanSyncSuppressed,
@@ -50,6 +51,10 @@ export interface KanbanSyncDeps {
 const nowSec = () => Math.floor(Date.now() / 1000)
 
 // --- forward: SQLite -> GitHub (drain the outbox) ---
+
+export function backfillForwardOutbox(): number {
+  return backfillKanbanSyncOutbox()
+}
 
 export async function drainForward(deps: KanbanSyncDeps): Promise<number> {
   const { client } = deps
@@ -174,7 +179,7 @@ export function startKanbanProjectsSync(cfg: KanbanSyncBootConfig): void {
   const pollMs = cfg.pollMs ?? 45_000
   const deps: KanbanSyncDeps = { client: cfg.client }
   let running = false
-  timer = setInterval(async () => {
+  const tick = async () => {
     if (running) return // never overlap ticks
     running = true
     try {
@@ -185,7 +190,11 @@ export function startKanbanProjectsSync(cfg: KanbanSyncBootConfig): void {
     } finally {
       running = false
     }
-  }, pollMs)
+  }
+  const backfilled = backfillForwardOutbox()
+  if (backfilled > 0) logger.info({ count: backfilled }, 'kanban-sync: backfilled forward outbox')
+  timer = setInterval(tick, pollMs)
+  void tick()
   logger.info({ pollMs }, 'kanban-sync: started')
 }
 

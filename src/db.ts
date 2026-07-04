@@ -1318,6 +1318,27 @@ export function deleteKanbanOutboxRow(seq: number): void {
   db.prepare('DELETE FROM kanban_sync_outbox WHERE seq = ?').run(seq)
 }
 
+export function backfillKanbanSyncOutbox(): number {
+  const now = Math.floor(Date.now() / 1000)
+  return db.transaction(() => {
+    // Boot-time reconcile for cards created before the transactional outbox
+    // existed. Skip anything already mapped or already queued so restarts stay
+    // idempotent and the normal forward drain remains the only GitHub writer.
+    return db.prepare(
+      `INSERT INTO kanban_sync_outbox (card_id, op, enqueued_at)
+       SELECT c.id, 'upsert', ?
+       FROM kanban_cards c
+       LEFT JOIN kanban_sync_state s ON s.card_id = c.id
+       WHERE c.archived_at IS NULL
+         AND s.card_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM kanban_sync_outbox o WHERE o.card_id = c.id
+         )
+       ORDER BY c.sort_order ASC, c.created_at ASC, c.id ASC`
+    ).run(now).changes
+  })() as number
+}
+
 export function getKanbanSyncState(cardId: string): KanbanSyncState | null {
   return (db.prepare('SELECT * FROM kanban_sync_state WHERE card_id = ?').get(cardId) as KanbanSyncState | undefined) ?? null
 }
@@ -2307,4 +2328,3 @@ export function pruneTokenUsage(): number {
   const info = db.prepare('DELETE FROM token_usage WHERE timestamp < ?').run(cutoff)
   return info.changes
 }
-
