@@ -21,6 +21,8 @@ import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
 import { startReauthHealer } from './web/reauth-healer.js'
 import { startAutoRestartRunner } from './web/auto-restart-runner.js'
 import { startContextCleanRunner } from './web/context-clean-runner.js'
+import { startStuckAgentWatcher } from './web/stuck-agent-watcher.js'
+import { startTaskPickupRunner } from './web/task-pickup-runner.js'
 import { startModelFallbackRunner } from './web/model-fallback-runner.js'
 import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
@@ -343,6 +345,12 @@ export function startWebServer(port = 3420): http.Server {
   const contextCleanInterval = webOnly ? undefined : startContextCleanRunner()
   if (!webOnly) logger.info('Context-clean runner started (60s poll, 50s offset)')
 
+  const stuckAgentInterval = webOnly ? undefined : startStuckAgentWatcher()
+  if (!webOnly) logger.info('Stuck-agent watcher started (60s poll, 55s offset)')
+
+  const taskPickupInterval = webOnly ? undefined : startTaskPickupRunner()
+  if (!webOnly) logger.info('Task-pickup runner started (60s poll, 57s offset)')
+
   const modelFallbackInterval = webOnly ? undefined : startModelFallbackRunner()
   if (!webOnly) logger.info('Model-fallback runner started (60s poll, 50s offset)')
 
@@ -428,6 +436,8 @@ export function startWebServer(port = 3420): http.Server {
     if (reauthHealerInterval) clearInterval(reauthHealerInterval)
     clearInterval(autoRestartInterval)
     clearInterval(contextCleanInterval)
+    clearInterval(stuckAgentInterval)
+    clearInterval(taskPickupInterval)
     clearInterval(modelFallbackInterval)
     clearInterval(updateCheckerInterval)
     clearInterval(tokenCollectInterval)
