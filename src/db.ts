@@ -1189,6 +1189,29 @@ export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrd
   return changed
 }
 
+// Cards currently in_progress and assigned to `assignee`. Used by the stuck-agent
+// watcher to only judge an agent that is supposed to be actively working.
+export function getInProgressCardsForAssignee(assignee: string): { id: string; title: string }[] {
+  return db.prepare(
+    "SELECT id, title FROM kanban_cards WHERE assignee = ? AND status = 'in_progress' AND archived_at IS NULL"
+  ).all(assignee) as { id: string; title: string }[]
+}
+
+// The single highest-priority, oldest not-yet-dispatched planned/waiting card
+// assigned to `assignee`, or null. Used by the autonomous task-pickup watcher.
+// dispatched_at IS NULL is the once-only guard: a card already handed to the
+// agent (even if the agent later parked it back to waiting) is never re-picked.
+export function getNextPickableCardForAssignee(assignee: string): KanbanCard | null {
+  return (db.prepare(
+    `SELECT * FROM kanban_cards
+       WHERE assignee = ? AND status IN ('planned','waiting')
+         AND dispatched_at IS NULL AND archived_at IS NULL
+       ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END ASC,
+                created_at ASC
+       LIMIT 1`
+  ).get(assignee) as KanbanCard | undefined) ?? null
+}
+
 // Stamp the once-only kanban -> agent dispatch guard. Returns false if the
 // card id does not exist.
 export function markKanbanCardDispatched(id: string): boolean {
