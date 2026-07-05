@@ -170,6 +170,30 @@ export function initDatabase(dbPathOverride?: string): void {
     // column already exists
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_kanban_parent ON kanban_cards(parent_id)')
+  // Kanban <-> GitHub Projects v2 sync (deterministic, zero runtime LLM token).
+  // outbox: transactional forward-path queue -- the kanban writer functions
+  // enqueue a row IN THE SAME write so a crash between the DB write and the
+  // GraphQL push cannot lose a change; the sync loop drains + deletes on success.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS kanban_sync_outbox (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      card_id TEXT NOT NULL,
+      op TEXT NOT NULL CHECK(op IN ('upsert','delete')),
+      enqueued_at INTEGER NOT NULL
+    )
+  `)
+  // sync_state: per-card binding to the Project item + last-synced fingerprint,
+  // used for change detection (which side moved) and echo-loop avoidance.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS kanban_sync_state (
+      card_id TEXT PRIMARY KEY,
+      item_id TEXT,
+      last_synced_hash TEXT,
+      local_updated_at INTEGER,
+      remote_updated_at INTEGER,
+      synced_at INTEGER
+    )
+  `)
   // Migration: add dispatched_at to kanban_cards (kanban -> agent dispatch
   // once-only guard). Older installs created the table without it.
   try {
@@ -1124,6 +1148,7 @@ export function createKanbanCard(card: {
     card.assignee ?? null, card.priority ?? 'normal',
     card.project ?? null, card.parent_id ?? null, card.due_date ?? null, sortOrder, now, now
   )
+  enqueueKanbanSync(card.id, 'upsert')
 }
 
 export function updateKanbanCard(id: string, fields: Partial<Omit<KanbanCard, 'id' | 'created_at'>>): boolean {
@@ -1131,10 +1156,12 @@ export function updateKanbanCard(id: string, fields: Partial<Omit<KanbanCard, 'i
   if (!card) return false
   const now = Math.floor(Date.now() / 1000)
   const f = { ...card, ...fields, updated_at: now }
-  return db.prepare(
+  const changed = db.prepare(
     `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, sort_order=?, updated_at=?, archived_at=?
      WHERE id=?`
   ).run(f.title, f.description, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.sort_order, f.updated_at, f.archived_at, id).changes > 0
+  if (changed) enqueueKanbanSync(id, 'upsert')
+  return changed
 }
 
 export function getChildCards(parentId: string): KanbanCard[] {
@@ -1143,9 +1170,11 @@ export function getChildCards(parentId: string): KanbanCard[] {
 
 export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrder: number): boolean {
   const now = Math.floor(Date.now() / 1000)
-  return db.prepare(
+  const changed = db.prepare(
     'UPDATE kanban_cards SET status=?, sort_order=?, updated_at=? WHERE id=?'
   ).run(status, sortOrder, now, id).changes > 0
+  if (changed) enqueueKanbanSync(id, 'upsert')
+  return changed
 }
 
 // Stamp the once-only kanban -> agent dispatch guard. Returns false if the
@@ -1157,12 +1186,18 @@ export function markKanbanCardDispatched(id: string): boolean {
 
 export function archiveKanbanCard(id: string): boolean {
   const now = Math.floor(Date.now() / 1000)
-  return db.prepare('UPDATE kanban_cards SET archived_at=?, updated_at=? WHERE id=?').run(now, now, id).changes > 0
+  const changed = db.prepare('UPDATE kanban_cards SET archived_at=?, updated_at=? WHERE id=?').run(now, now, id).changes > 0
+  // Archive crosses to GitHub as a delete of the Project item (decision #2:
+  // archive, never hard-delete on either side).
+  if (changed) enqueueKanbanSync(id, 'delete')
+  return changed
 }
 
 export function unarchiveKanbanCard(id: string): boolean {
   const now = Math.floor(Date.now() / 1000)
-  return db.prepare('UPDATE kanban_cards SET archived_at=NULL, updated_at=? WHERE id=? AND archived_at IS NOT NULL').run(now, id).changes > 0
+  const changed = db.prepare('UPDATE kanban_cards SET archived_at=NULL, updated_at=? WHERE id=? AND archived_at IS NOT NULL').run(now, id).changes > 0
+  if (changed) enqueueKanbanSync(id, 'upsert')
+  return changed
 }
 
 export interface ArchivedKanbanCard {
@@ -1236,8 +1271,95 @@ export function deleteKanbanCard(id: string): boolean {
     db.prepare('DELETE FROM kanban_comments WHERE card_id = ?').run(cardId)
     db.prepare('DELETE FROM kanban_card_labels WHERE card_id = ?').run(cardId)
     db.prepare('UPDATE kanban_cards SET parent_id = NULL WHERE parent_id = ?').run(cardId)
-    return db.prepare('DELETE FROM kanban_cards WHERE id = ?').run(cardId).changes > 0
+    const gone = db.prepare('DELETE FROM kanban_cards WHERE id = ?').run(cardId).changes > 0
+    // Enqueue inside the same transaction so the delete intent can never be
+    // lost (transactional outbox). No-op under the backward-write suppress flag.
+    if (gone) enqueueKanbanSync(cardId, 'delete')
+    return gone
   })(id) as boolean
+}
+
+// --- Kanban <-> GitHub Projects v2 sync: forward-path outbox + sync state ---
+// All deterministic SQLite helpers; the GraphQL side lives in
+// kanban-projects-sync.ts. Zero LLM, zero network here.
+
+export interface KanbanSyncOutboxRow { seq: number; card_id: string; op: 'upsert' | 'delete'; enqueued_at: number }
+export interface KanbanSyncState {
+  card_id: string
+  item_id: string | null
+  last_synced_hash: string | null
+  local_updated_at: number | null
+  remote_updated_at: number | null
+  synced_at: number | null
+}
+
+// Echo-loop guard: while applying a Projects -> SQLite write (backward path),
+// the kanban writer functions must NOT enqueue an outbox row, otherwise the
+// change would bounce straight back to GitHub. The backward path sets this
+// around its updateKanbanCard call. Node is single-threaded so a plain module
+// flag is race-free (mirrors store-watcher's setStoreWriteActor).
+let kanbanSyncSuppressed = false
+export function setKanbanSyncSuppressed(v: boolean): void { kanbanSyncSuppressed = v }
+
+// Enqueue a forward-sync intent. No-op when suppressed (backward write in
+// progress). Called by the kanban writer functions right after their write.
+export function enqueueKanbanSync(cardId: string, op: 'upsert' | 'delete'): void {
+  if (kanbanSyncSuppressed) return
+  db.prepare('INSERT INTO kanban_sync_outbox (card_id, op, enqueued_at) VALUES (?, ?, ?)')
+    .run(cardId, op, Math.floor(Date.now() / 1000))
+}
+
+export function drainKanbanOutbox(limit = 100): KanbanSyncOutboxRow[] {
+  return db.prepare('SELECT seq, card_id, op, enqueued_at FROM kanban_sync_outbox ORDER BY seq ASC LIMIT ?')
+    .all(limit) as KanbanSyncOutboxRow[]
+}
+
+export function deleteKanbanOutboxRow(seq: number): void {
+  db.prepare('DELETE FROM kanban_sync_outbox WHERE seq = ?').run(seq)
+}
+
+export function backfillKanbanSyncOutbox(): number {
+  const now = Math.floor(Date.now() / 1000)
+  return db.transaction(() => {
+    // Boot-time reconcile for cards created before the transactional outbox
+    // existed. Skip anything already mapped or already queued so restarts stay
+    // idempotent and the normal forward drain remains the only GitHub writer.
+    return db.prepare(
+      `INSERT INTO kanban_sync_outbox (card_id, op, enqueued_at)
+       SELECT c.id, 'upsert', ?
+       FROM kanban_cards c
+       LEFT JOIN kanban_sync_state s ON s.card_id = c.id
+       WHERE c.archived_at IS NULL
+         AND s.card_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM kanban_sync_outbox o WHERE o.card_id = c.id
+         )
+       ORDER BY c.sort_order ASC, c.created_at ASC, c.id ASC`
+    ).run(now).changes
+  })() as number
+}
+
+export function getKanbanSyncState(cardId: string): KanbanSyncState | null {
+  return (db.prepare('SELECT * FROM kanban_sync_state WHERE card_id = ?').get(cardId) as KanbanSyncState | undefined) ?? null
+}
+
+export function listKanbanSyncStates(): KanbanSyncState[] {
+  return db.prepare('SELECT * FROM kanban_sync_state').all() as KanbanSyncState[]
+}
+
+export function upsertKanbanSyncState(s: KanbanSyncState): void {
+  db.prepare(
+    `INSERT INTO kanban_sync_state (card_id, item_id, last_synced_hash, local_updated_at, remote_updated_at, synced_at)
+     VALUES (@card_id, @item_id, @last_synced_hash, @local_updated_at, @remote_updated_at, @synced_at)
+     ON CONFLICT(card_id) DO UPDATE SET
+       item_id=excluded.item_id, last_synced_hash=excluded.last_synced_hash,
+       local_updated_at=excluded.local_updated_at, remote_updated_at=excluded.remote_updated_at,
+       synced_at=excluded.synced_at`
+  ).run(s)
+}
+
+export function deleteKanbanSyncState(cardId: string): void {
+  db.prepare('DELETE FROM kanban_sync_state WHERE card_id = ?').run(cardId)
 }
 
 export function getKanbanComments(cardId: string): KanbanComment[] {
@@ -2230,4 +2352,3 @@ export function pruneTokenUsage(): number {
   const info = db.prepare('DELETE FROM token_usage WHERE timestamp < ?').run(cutoff)
   return info.changes
 }
-

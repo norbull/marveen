@@ -22,6 +22,8 @@ import { ensureDiscordChannelGroup } from './web/discord-group-bootstrap.js'
 import { startChannelRequestWatcher, stopChannelRequestWatcher } from './web/channel-request-watcher.js'
 import { startStoreWatcher, stopStoreWatcher } from './store-watcher.js'
 import { startAutoRecovery, stopAutoRecovery } from './web/auto-recovery.js'
+import { startKanbanProjectsSync, stopKanbanProjectsSync } from './kanban-projects-sync.js'
+import { buildKanbanProjectsClient } from './kanban-projects-client.js'
 import { AGENTS_BASE_DIR } from './web/agent-config.js'
 import {
   acquirePortLock,
@@ -353,6 +355,7 @@ const shutdown = (): void => {
     try { stopChannelRequestWatcher() } catch (err) { logger.warn({ err }, 'stopChannelRequestWatcher threw during shutdown') }
     try { stopStoreWatcher() } catch (err) { logger.warn({ err }, 'stopStoreWatcher threw during shutdown') }
     try { stopAutoRecovery() } catch (err) { logger.warn({ err }, 'stopAutoRecovery threw during shutdown') }
+    try { stopKanbanProjectsSync() } catch (err) { logger.warn({ err }, 'stopKanbanProjectsSync threw during shutdown') }
     if (decayInterval) clearInterval(decayInterval)
     if (digestTimer) clearTimeout(digestTimer)
     if (digestInterval) clearInterval(digestInterval)
@@ -485,6 +488,13 @@ async function main(): Promise<void> {
   // Auto-recovery orchestrator (#fdfa238a). Dry-run by default; needs the web
   // server + channel sessions up first so its probes have something to observe.
   startAutoRecovery()
+
+  // Kanban <-> GitHub Projects v2 sync. Feature-flagged: no-op unless both the
+  // project-scope token and the project id are configured in store/. Built async
+  // (discovers the project schema once) without blocking the rest of boot.
+  buildKanbanProjectsClient()
+    .then((client) => startKanbanProjectsSync({ client }))
+    .catch((err) => logger.warn({ err }, 'kanban-sync: client boot failed -- sync not started'))
 
   logger.info(`Marveen fut! Dashboard: http://localhost:${WEB_PORT}`)
   logger.info('Telegram kommunikacio: Claude Code Channels kezeli')
