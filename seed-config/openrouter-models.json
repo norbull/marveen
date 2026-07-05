@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "_doc": "OpenRouter free-layer model alias table. Dex-only PILOT. This is a PLUS draft tool next to Nyx (local Qwen2.5 on the GPU) and Codex -- it does NOT replace them and no default workflow switches to it. openrouter-draft.py resolves alias -> model id from here (store/openrouter-models.json overrides this seed if present). Free :free endpoints get deprecated/rate-limited -- before trusting an alias long-term, re-verify it against the OpenRouter Models API (https://openrouter.ai/api/v1/models). Rate limits are FLEET-wide, not per-agent: 20 req/min, 50 req/day under 10 USD credit.",
+  "default": "dex_code_primary",
+  "models": {
+    "dex_code_primary": "poolside/laguna-xs-2.1:free",
+    "dex_code_fallback": "cohere/north-mini-code:free",
+    "orin_nova_critic": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "atlas_iris_general": "qwen/qwen3-next-80b-a3b-instruct:free",
+    "general_fallback": "meta-llama/llama-3.3-70b-instruct:free",
+    "utility": "nvidia/nemotron-3-nano-30b-a3b:free",
+    "safety": "nvidia/nemotron-3.5-content-safety:free"
+  }
+}
