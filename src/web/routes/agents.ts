@@ -96,6 +96,7 @@ import { readActiveModelFromProjectDir, readContextTokensFromProjectDir } from '
 import { detectPaneState } from '../../pane-state.js'
 import { detectReauthNeeded } from '../reauth-detect.js'
 import { readAutoRestartConfig, writeAutoRestartConfig } from '../auto-restart-store.js'
+import { readOpusEscalationConfig, readEscalationState, writeEscalationState } from '../opus-escalation-store.js'
 import type { AutoRestartConfig } from '../../auto-restart.js'
 import { setStoreWriteActor } from '../../store-watcher.js'
 import { attemptChannelMcpReconnect } from '../channel-mcp-reconnect.js'
@@ -615,6 +616,58 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
       return suggestForAgent(name, currentModel, personaText, contextTokens, signals)
     })
     json(res, { results })
+    return true
+  }
+
+  // --- orin Opus-escalation fallback (kanban #2b7badb8) ---------------------
+  // The EXPLICIT trigger orin calls when a genuinely hard coordination turn
+  // warrants Opus. Norbi's rule: rare, never routine. The runner
+  // (opus-escalation-runner.ts) performs the live `/model` switch on the next
+  // idle tick, and a safety cap always reverts. Bearer auth is enforced centrally.
+  if (path === '/api/agents/escalation' && method === 'GET') {
+    json(res, { config: readOpusEscalationConfig(), state: readEscalationState() })
+    return true
+  }
+
+  if (path === '/api/agents/escalate' && method === 'POST') {
+    let reason: string | undefined
+    try {
+      const d = JSON.parse((await readBody(req)).toString() || '{}')
+      if (typeof d?.reason === 'string' && d.reason.trim()) reason = d.reason.trim().slice(0, 500)
+    } catch { /* empty/invalid body -> no reason */ }
+    const cfg = readOpusEscalationConfig()
+    const prev = readEscalationState()
+    const state = writeEscalationState({
+      ...prev,
+      active: true,
+      requestedAt: Date.now(),
+      ...(reason !== undefined ? { reason } : {}),
+    })
+    logger.warn({ reason, enabled: cfg.enabled }, 'opus-escalation: escalation REQUESTED via API')
+    json(res, {
+      ok: true,
+      enabled: cfg.enabled,
+      state,
+      note: cfg.enabled
+        ? 'Escalation requested; the runner will switch orin to Opus on the next idle tick.'
+        : 'Feature is DISABLED -- request recorded but no switch occurs until an operator enables it.',
+    })
+    return true
+  }
+
+  if (path === '/api/agents/de-escalate' && method === 'POST') {
+    const prev = readEscalationState()
+    const state = writeEscalationState({
+      active: false,
+      requestedAt: null,
+      ...(prev.appliedModel !== undefined ? { appliedModel: prev.appliedModel } : {}),
+    })
+    logger.warn('opus-escalation: de-escalation requested via API')
+    json(res, {
+      ok: true,
+      state,
+      note: 'De-escalation requested; the runner will revert orin to the base model on the next idle tick.',
+    })
     return true
   }
 

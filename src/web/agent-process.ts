@@ -1313,6 +1313,34 @@ export function captureParkedInputView(session: string, host: string | null = nu
   }
 }
 
+// Live `/model` switch injected into a running session's pane. Unlike a model
+// change via restart this PRESERVES the conversation -- the context stays in the
+// live session (verified empirically on CC 2.1.201, see kanban #2b7badb8). Used
+// by the Opus-escalation runner to lift orin to Opus for a hard coordination
+// turn and drop back to Sonnet afterwards, without the restart context loss that
+// the `!hasChannel` --continue guard would otherwise cause for a channel agent.
+//
+// Sequence (empirically observed): type `/model <id>` + Enter, then a confirm
+// Enter for the switch dialog, then verify the pane shows "Set model to". The
+// CALLER MUST gate this on an idle pane (paneLooksIdle) so it never cuts a live
+// turn. Returns true only when the switch is confirmed in the pane.
+export function switchModelLive(session: string, host: string | null, modelId: string): boolean {
+  try {
+    // -l = literal text, so the model id (incl. the `[1m]` suffix) is typed as-is
+    // rather than being parsed as tmux key names.
+    runTmux(host, ['send-keys', '-t', session, '-l', `/model ${modelId}`], { timeout: 5000 })
+    runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
+    // Let the confirm dialog render, then accept it.
+    execFileSync('/bin/sleep', ['0.5'], { timeout: 2000 })
+    runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
+    execFileSync('/bin/sleep', ['0.5'], { timeout: 2000 })
+    const pane = capturePane(session, host)
+    return pane != null && /Set model to/i.test(pane)
+  } catch {
+    return false
+  }
+}
+
 // Check if a Claude Code tmux session is ready to accept a new prompt.
 //
 // The detection has two layers, both needed to close the frame-level
