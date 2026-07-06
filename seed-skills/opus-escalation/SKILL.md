@@ -19,7 +19,7 @@ ritka, celzott hasznalat a helyes.
 1. Eszkalacio kerese (opcionalis `reason` audithoz):
    ```bash
    curl -s -X POST http://localhost:3420/api/agents/escalate \
-     -H "Authorization: Bearer $(cat /home/karma/marveen/store/.dashboard-token)" \
+     -H "Authorization: Bearer $(cat {{INSTALL_DIR}}/store/.dashboard-token)" \
      -H 'Content-Type: application/json' \
      -d '{"reason":"MIERT kell Opus (rovid)"}'
    ```
@@ -30,7 +30,7 @@ ritka, celzott hasznalat a helyes.
 3. Amikor a nehez resz kesz, VALTS VISSZA azonnal (ne hagyd Opuson feleslegesen):
    ```bash
    curl -s -X POST http://localhost:3420/api/agents/de-escalate \
-     -H "Authorization: Bearer $(cat /home/karma/marveen/store/.dashboard-token)"
+     -H "Authorization: Bearer $(cat {{INSTALL_DIR}}/store/.dashboard-token)"
    ```
 
 ## Buktatok
