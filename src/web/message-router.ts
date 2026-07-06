@@ -1,5 +1,6 @@
 import { logger } from '../logger.js'
 import { MAIN_AGENT_ID } from '../config.js'
+import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { resolveAgentChannelStateDir } from './voice-directive.js'
 import {
   getPendingMessages,
@@ -30,6 +31,94 @@ const JANITOR_PARKED_MIN_AGE_MS = 45 * 1000
 // Log "skipping, target not ready" at most once per message id so a busy
 // receiver over many 5s ticks does not spam the log.
 const routerLoggedMisses: Set<number> = new Set()
+
+// --- main-agent wake-nudge (kanban #96cd2ac9) -------------------------------
+// The main agent (orin) is delivered its inter-agent inbox by the PULL model
+// (the UserPromptSubmit inbox-drain hook), NOT the router tmux-inject path --
+// injecting CONTENT into its perpetually-busy channel session raced and stalled
+// delivery for ~1h (see the isMainAgent branch below, message-router.ts race).
+// But the drain hook only fires when the main agent takes a TURN, and it only
+// turns on a user prompt or the 30-minute heartbeat -- so a sub-agent's reply
+// can sit pending for up to 30 minutes. The wake-nudge closes that latency gap
+// WITHOUT reintroducing the race: when a main-agent message has waited long
+// enough AND the channel session is idle, the router injects a minimal,
+// CONTENT-FREE prompt so the drain hook fires and atomically claims the backlog.
+// This is the exact operation the scheduler already performs against the same
+// session for heartbeats (sendPromptToSession, idle-gated) -- only the trigger
+// differs. No content and no markMessageDelivered here: the pull path owns the
+// atomic claim and the security framing (single source, no drift).
+
+// How long a main-agent message must wait before the first wake-nudge. Gives a
+// naturally-arriving user prompt / heartbeat a chance to drain it first, so an
+// idle channel is not nudged for a reply the main agent was about to pick up.
+const MAIN_WAKE_MIN_AGE_MS = 30 * 1000
+// Minimum gap between wake-nudges. One nudge starts a turn whose drain claims
+// the WHOLE backlog, so re-nudging sooner would pile redundant prompts on a
+// session that is already handling the inbox. Bounds it to at most one nudge
+// per window even if the turn is slow to start.
+const MAIN_WAKE_DEBOUNCE_MS = 60 * 1000
+// The content-free wake prompt. The inbox-drain UserPromptSubmit hook PREPENDS
+// the claimed (already security-wrapped) messages above this line, so the nudge
+// text is only a trailing trigger -- it must never carry inter-agent content
+// itself (that is the race this design avoids).
+const MAIN_WAKE_NUDGE =
+  '[orin-wake] Bejövő inter-agent üzenet(ek) várnak a soron; a drain hook behúzta őket a kontextusba fentebb. Dolgozd fel és válaszolj.'
+// When the last wake-nudge was sent (module-scoped, mirrors routerLoggedMisses).
+let _lastMainWakeAt = 0
+
+/**
+ * Pure decision: should the router send a wake-nudge to the main agent's
+ * channel session? Dependency-free so it is unit-testable without tmux, like
+ * shouldAbandon. ALL conditions must hold:
+ *   - the channel session exists (nothing to wake otherwise);
+ *   - it is idle (never inject a prompt mid-turn -- that is the race);
+ *   - the oldest pending main-agent message is older than minAgeMs (let the
+ *     natural pull drain a fresh one first);
+ *   - the debounce window since the last nudge has elapsed (one nudge per
+ *     backlog, not one per tick).
+ */
+export function shouldWakeMainAgent(params: {
+  oldestPendingAgeMs: number
+  now: number
+  lastWakeAt: number
+  sessionExists: boolean
+  sessionIdle: boolean
+  minAgeMs: number
+  debounceMs: number
+}): boolean {
+  const { oldestPendingAgeMs, now, lastWakeAt, sessionExists, sessionIdle, minAgeMs, debounceMs } = params
+  if (!sessionExists) return false
+  if (!sessionIdle) return false
+  if (oldestPendingAgeMs <= minAgeMs) return false
+  if (now - lastWakeAt < debounceMs) return false
+  return true
+}
+
+// I/O wrapper around shouldWakeMainAgent: probes the channel session's presence
+// and idle state, and on a positive decision injects the content-free nudge and
+// records the debounce timestamp. Called at most ONCE per tick (the caller gates
+// on a per-tick flag) so a backlog of main-agent messages triggers a single
+// readiness probe, not one per message.
+function maybeWakeMainAgent(oldestPendingAgeMs: number, now: number): void {
+  // Cheap gates first so a fresh message or an in-debounce window skips the
+  // tmux capture-pane entirely (keep the tick's tmux I/O bounded).
+  if (oldestPendingAgeMs <= MAIN_WAKE_MIN_AGE_MS) return
+  if (now - _lastMainWakeAt < MAIN_WAKE_DEBOUNCE_MS) return
+  const sessionExists = sessionExistsOnHost(null, MAIN_CHANNELS_SESSION)
+  const sessionIdle = sessionExists && isSessionReadyForPrompt(MAIN_CHANNELS_SESSION, null)
+  if (!shouldWakeMainAgent({
+    oldestPendingAgeMs, now, lastWakeAt: _lastMainWakeAt,
+    sessionExists, sessionIdle,
+    minAgeMs: MAIN_WAKE_MIN_AGE_MS, debounceMs: MAIN_WAKE_DEBOUNCE_MS,
+  })) return
+  try {
+    sendPromptToSession(MAIN_CHANNELS_SESSION, MAIN_WAKE_NUDGE, null)
+    _lastMainWakeAt = now
+    logger.info({ session: MAIN_CHANNELS_SESSION, ageMs: oldestPendingAgeMs }, 'message-router: wake-nudged main agent (pending inbox, idle session)')
+  } catch (err) {
+    logger.warn({ err, session: MAIN_CHANNELS_SESSION }, 'message-router: main-agent wake-nudge failed')
+  }
+}
 
 /**
  * Pure decision: should a pending inter-agent message be abandoned?
@@ -84,6 +173,11 @@ export async function runMessageRouterTick(): Promise<void> {
     // pattern. Ordering is preserved (oldest first) so nothing is starved.
     const pending = getPendingMessages().slice(0, MAX_MESSAGES_PER_TICK)
     const now = Date.now()
+    // Wake-nudge the main agent at most once per tick: `pending` is oldest-first,
+    // so the FIRST main-agent message we hit carries the oldest main-agent age --
+    // the correct age-gate input. The flag stops a backlog of main messages from
+    // firing one readiness probe (capture-pane) per message.
+    let mainWakeCheckedThisTick = false
     for (const msg of pending) {
       const ageMs = now - msg.created_at * 1000
       // The main agent runs in `${MAIN_AGENT_ID}-channels`, not `agent-${name}`,
@@ -96,7 +190,18 @@ export async function runMessageRouterTick(): Promise<void> {
       // what stalled inter-agent delivery to the main agent for ~1h on a busy
       // day. Leave the message pending; the next main-agent turn claims it
       // atomically. Sub-agents keep the tmux-inject path (they have idle gaps).
-      if (isMainAgent) continue
+      //
+      // Wake-nudge (kanban #96cd2ac9): to close the "up to 30 min until the next
+      // main-agent turn" latency, nudge the idle channel session with a
+      // CONTENT-FREE prompt so the drain hook fires now. Still no content-inject
+      // and no markMessageDelivered here -- the pull path owns claim + framing.
+      if (isMainAgent) {
+        if (!mainWakeCheckedThisTick) {
+          mainWakeCheckedThisTick = true
+          maybeWakeMainAgent(ageMs, now)
+        }
+        continue
+      }
       const session = agentSessionName(msg.to_agent)
       // Remote sub-agents run their tmux session on the laptop; resolve the host
       // so the existence/readiness checks and the send all cross the ssh
