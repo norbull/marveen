@@ -187,6 +187,71 @@ def _host_allowlisted(host):
     return False
 
 
+# --- position-independent git subcommand detection --------------------------
+# The CRITICAL_BASH patterns above match only when the subcommand immediately
+# follows 'git'.  git -C <path> push / git -c user.name=x push break them
+# because the global flag+value sits between 'git' and the subcommand.
+# This set covers all flags that consume a following token as their value:
+_GIT_SKIP_FLAGS = frozenset({
+    '-C', '-c', '--git-dir', '--work-tree', '--namespace',
+    '--exec-path', '--html-path', '--man-path', '--info-path',
+})
+
+# subcommand -> required extra flag (None = critical regardless of flags)
+_GIT_CRITICAL_SUBCMDS = {
+    'push':   None,
+    'clean':  None,
+    'rebase': None,
+    'reset':  '--hard',
+    'branch': '-D',
+    'config': '--global',
+}
+
+
+def _extract_git_subcmds(cmd):
+    """Return [(subcmd_lower, rest_tokens)] for every git invocation in cmd.
+
+    Splits on shell separators first so a compound command yields each
+    git call separately.  Skips git's global flags (both --flag value and
+    --flag=value forms) to reach the actual subcommand.
+    """
+    results = []
+    for segment in re.split(r'[;&|()`\n]', cmd):
+        tokens = segment.split()
+        for i, tok in enumerate(tokens):
+            if tok != 'git':
+                continue
+            j = i + 1
+            while j < len(tokens):
+                t = tokens[j]
+                if t in _GIT_SKIP_FLAGS:
+                    j += 2          # flag + following value
+                elif t.startswith('-'):
+                    j += 1          # boolean flag or --flag=value one-token form
+                else:
+                    results.append((t.lower(), tokens[j + 1:]))
+                    break
+    return results
+
+
+def git_subcmd_is_critical(cmd):
+    """True if cmd contains a critical git subcommand, position-independently.
+
+    Catches git -C <path> push (and similar) that the CRITICAL_BASH regexes
+    miss because the global flag sits between 'git' and the subcommand.
+    Works alongside the existing patterns (additive, no regressions).
+    """
+    for subcmd, rest in _extract_git_subcmds(cmd):
+        required = _GIT_CRITICAL_SUBCMDS.get(subcmd)
+        if subcmd not in _GIT_CRITICAL_SUBCMDS:
+            continue
+        if required is None:
+            return True
+        if re.search(re.escape(required) + r'\b', ' '.join(rest)):
+            return True
+    return False
+
+
 def http_egress_critical(cmd):
     """True if cmd is a curl/wget to a non-allowlisted external host.
 
@@ -216,6 +281,8 @@ def is_critical(tool, ti):
         for p in CRITICAL_BASH:
             if re.search(p, cmd, re.I):
                 return ("bash", raw)
+        if git_subcmd_is_critical(cmd):
+            return ("bash", raw)
         if http_egress_critical(cmd):
             return ("http_external", raw)
     if tool in WRITE_TOOLS:

@@ -55,6 +55,18 @@ CASES = [
     ("recursive delete", "rm -rf /home/x", "bash"),
     ("delete beats curl", "curl http://localhost:3420/api/x && rm -rf /tmp/../etc", "bash"),
 
+    # --- git -C / global-flag bypass fix (kanban 3da353e1) ---
+    ("git -C push bypass", "git -C /home/karma/marveen push origin develop", "bash"),
+    ("git -C reset --hard bypass", "git -C /repo reset --hard HEAD~1", "bash"),
+    ("git -C clean bypass", "git -C /repo clean -fdx", "bash"),
+    ("git -C branch -D bypass", "git -C /repo branch -D old-branch", "bash"),
+    ("git -C rebase bypass", "git -C /repo rebase main", "bash"),
+    ("git -c push bypass", "git -c user.name=x push origin main", "bash"),
+    ("git --git-dir push bypass", "git --git-dir=/repo/.git push origin main", "bash"),
+    ("git -C safe status", "git -C /repo status", None),
+    ("git -C safe log", "git -C /repo log --oneline", None),
+    ("git -C safe fetch", "git -C /repo fetch origin", None),
+
     # --- regression: routine non-HTTP stays allowed ---
     ("ls", "ls -la /home", None),
     ("git status", "git status", None),
