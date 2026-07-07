@@ -282,6 +282,46 @@ const IDLE_BACKGROUND_ONE_SHELL_HIDDEN = [
   '  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage',
 ].join('\n')
 
+// TodoWrite-widget idle footer (kanban #53 regression). When a session
+// has an active TodoWrite/Task list, Claude Code renders a "N tasks
+// (...)" panel above the input box and appends "· ctrl+t to hide tasks ·
+// ← for agents · ↓ to manage" to the footer. The captured production
+// footer (dex, 2026-07-06) combined a background shell AND the tasks
+// panel: "· 1 shell · ctrl+t to hide tasks · ← for agents · ↓ to manage".
+// Under the OLD strict regex (`· \d+ shells? · (ctrl+t|↓ to manage)` with
+// no "← for agents" arm) a NON-shell tail like this was mis-read as
+// 'unknown' -> isSessionReadyForPrompt false -> the message-router
+// deferred forever and the sub-agent deadlocked (memory:
+// inter-agent-delivery-deadlock-unknown-pane). The v1.19.0 sync
+// generalised the tail (`· [^\n]*?(ctrl+t|↓ to manage)`) and added the
+// "← for agents" arm, closing the hole. This fixture is the REAL captured
+// footer; the assertion locks the widget-idle -> 'idle' behaviour so a
+// future regex change cannot silently re-open the deadlock.
+const IDLE_TODO_WIDGET = [
+  '  3 tasks (0 done, 3 open)',
+  '  ◻ Reprodukció: TodoWrite widget render elkapása',
+  '  ◻ detectPaneState widget-idle fix implementálása',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on · 1 shell · ctrl+t to hide tasks · ← for agents · ↓ to manage',
+].join('\n')
+
+// Same widget-idle scenario WITHOUT a background shell: the footer keeps
+// the "(shift+tab to cycle)" prefix and appends the tasks-panel + agents
+// hints. Verified against a detached (untracked) capture of the same
+// session, so no "N shell" segment is present.
+const IDLE_TODO_WIDGET_NO_SHELL = [
+  '  3 tasks (0 done, 3 open)',
+  '  ◻ detectPaneState widget-idle fix implementálása',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ctrl+t to hide tasks · ← for agents · ↓ to manage',
+].join('\n')
+
 // Wedged thinking-block API error. An assistant turn ended with the
 // 400 about thinking blocks that "cannot be modified"; the pane shows
 // the tool-output chrome (`⎿  API Error: ...`), a past-tense thinking
@@ -464,6 +504,18 @@ describe('detectPaneState', () => {
     // and inter-agent messages stalled until the next manual toggle.
     expect(detectPaneState(IDLE_BACKGROUND_SHELLS_HIDDEN)).toBe('idle')
     expect(detectPaneState(IDLE_BACKGROUND_ONE_SHELL_HIDDEN)).toBe('idle')
+  })
+
+  it('detects idle on a TodoWrite-widget footer (kanban #53 deadlock)', () => {
+    // Regression for the inter-agent delivery deadlock: a sub-agent with an
+    // active TodoWrite/Task list renders "· ctrl+t to hide tasks · ← for
+    // agents · ↓ to manage" in the footer. Under the pre-v1.19.0 regex this
+    // read as 'unknown', isSessionReadyForPrompt returned false, and the
+    // message-router deferred delivery forever (grant-nudge stuck pending,
+    // sub-agent deadlocked). Both the real captured shell+widget footer and
+    // the shell-free variant must classify as 'idle' so delivery resumes.
+    expect(detectPaneState(IDLE_TODO_WIDGET)).toBe('idle')
+    expect(detectPaneState(IDLE_TODO_WIDGET_NO_SHELL)).toBe('idle')
   })
 
   it('does NOT classify a truncated "· N shell" prefix as idle', () => {
