@@ -26,6 +26,13 @@ vi.mock('../config.js', () => ({
   MAIN_AGENT_ID: 'orin',
 }))
 
+// message-router imports MAIN_CHANNELS_SESSION from main-agent.js (wake-nudge).
+// Mock it so the real module -- which eagerly reads SERVICE_ID from the config
+// mock above (not provided here) -- is never loaded.
+vi.mock('../web/main-agent.js', () => ({
+  MAIN_CHANNELS_SESSION: 'orin-channels',
+}))
+
 vi.mock('../db.js', () => ({
   getPendingMessages: () => mockGetPendingMessages(),
   markMessageDelivered: (...a: unknown[]) => mockMarkDelivered(...a),
