@@ -25,6 +25,7 @@ import { startStuckAgentWatcher } from './web/stuck-agent-watcher.js'
 import { startTaskPickupRunner } from './web/task-pickup-runner.js'
 import { startModelFallbackRunner } from './web/model-fallback-runner.js'
 import { startOpusEscalationRunner } from './web/opus-escalation-runner.js'
+import { startContextGuardRunner } from './web/context-guard-runner.js'
 import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
@@ -364,6 +365,9 @@ export function startWebServer(port = 3420): http.Server {
   const opusEscalationInterval = webOnly ? undefined : startOpusEscalationRunner()
   if (!webOnly) logger.info('Opus-escalation runner started (60s poll, 55s offset)')
 
+  const contextGuardInterval = webOnly ? undefined : startContextGuardRunner()
+  if (!webOnly) logger.info('Context-guard runner started (60s poll, 55s offset)')
+
   const updateCheckerInterval = webOnly ? undefined : startUpdateChecker()
   if (!webOnly) logger.info('Update checker started (15min poll)')
 
@@ -449,6 +453,7 @@ export function startWebServer(port = 3420): http.Server {
     clearInterval(stuckAgentInterval)
     clearInterval(taskPickupInterval)
     clearInterval(modelFallbackInterval)
+    clearInterval(contextGuardInterval)
     clearInterval(updateCheckerInterval)
     clearInterval(tokenCollectInterval)
     return origClose(cb)
