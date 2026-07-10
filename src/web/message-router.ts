@@ -31,6 +31,12 @@ const JANITOR_PARKED_MIN_AGE_MS = 45 * 1000
 // Log "skipping, target not ready" at most once per message id so a busy
 // receiver over many 5s ticks does not spam the log.
 const routerLoggedMisses: Set<number> = new Set()
+// Wakeup cooldown for the main agent: the router fires at most one
+// sendPromptToSession wakeup per COOLDOWN_MS window to avoid spamming the
+// channels session. 45s gives enough headroom that a normal turn (typically
+// 5-30s) ends and drain-inbox fires before we would retry.
+let lastMainAgentWakeupMs = 0
+const MAIN_AGENT_WAKEUP_COOLDOWN_MS = 45 * 1000
 
 // --- main-agent wake-nudge (kanban #96cd2ac9) -------------------------------
 // The main agent (orin) is delivered its inter-agent inbox by the PULL model
@@ -297,8 +303,9 @@ export async function runMessageRouterTick(): Promise<void> {
       try {
         // channel-inbound carries the STT-applied deliveryContent; the agent
         // wrap (trusted/untrusted) carries the raw content. Single-source frame.
+        // msgId passed so receiving agents can write back via PUT /api/messages/:id.
         const content = isChannelInbound ? deliveryContent : msg.content
-        const { prefix, wrapped } = wrapAgentMessageForDelivery(category, safeFromAgent, msg.from_agent, content)
+        const { prefix, wrapped } = wrapAgentMessageForDelivery(category, safeFromAgent, msg.from_agent, content, msg.id)
         // Inline preamble so a fresh session (post hard-restart) doesn't miss
         // the context that explains the tag semantics.
         sendPromptToSession(session, prefix + wrapped, host)

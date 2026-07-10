@@ -15,12 +15,14 @@ import type { KanbanCard } from './db.js'
 const STATUS_TO_LABEL: Record<KanbanCard['status'], string> = {
   planned: 'Planned',
   in_progress: 'In Progress',
+  testing: 'Testing',
   waiting: 'Waiting',
   done: 'Done',
 }
 const LABEL_TO_STATUS: Record<string, KanbanCard['status']> = {
   Planned: 'planned',
   'In Progress': 'in_progress',
+  Testing: 'testing',
   Waiting: 'waiting',
   Done: 'done',
 }
