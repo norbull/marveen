@@ -34,8 +34,8 @@ import {
 // Remote-host agents are skipped: their transcripts live on the remote machine,
 // so the context size cannot be measured here (v1 limitation, logged once).
 
-const INITIAL_DELAY_MS = 55_000
-const INTERVAL_MS = 60_000
+const INITIAL_DELAY_MS = 270_000
+const INTERVAL_MS = 300_000
 
 // agent name -> guard state. In-memory: a dashboard restart re-arms every
 // agent at 'idle', which is safe -- the worst case is a repeated handoff
