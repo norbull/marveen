@@ -1344,7 +1344,7 @@ window._i18n.hu = {
   'updates.toast.status_timeout':'A frissítés állapota nem érkezett meg időben. Nézd meg a store/update.log fájlt.',
 
   // --- Onboarding wizard ---
-  'onboarding.title':            'Marveen beállítása',
+  'onboarding.title':            '{brand} beállítása',
   'onboarding.subtitle':         'Fejezd be a beállítást innen, a dashboardból, SSH nélkül.',
   'onboarding.saving':           'Mentés...',
   'onboarding.error':            'Hiba történt.',

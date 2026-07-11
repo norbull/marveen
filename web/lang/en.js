@@ -1346,7 +1346,7 @@ window._i18n.en = {
   'updates.toast.status_timeout':'Update status did not arrive in time. Check store/update.log.',
 
   // --- Onboarding wizard ---
-  'onboarding.title':            'Set up Marveen',
+  'onboarding.title':            'Set up {brand}',
   'onboarding.subtitle':         'Finish setup here, from the dashboard, no SSH needed.',
   'onboarding.saving':           'Saving...',
   'onboarding.error':            'Something went wrong.',
