@@ -454,7 +454,13 @@ MAIN_BOT_PID_FILE="$HOME/.claude/channels/$CHANNEL_PROVIDER/bot.pid"
 PLUGIN_NEVER_STARTED_DEADLINE=$((START_TS + 600))
 # Died-after-up budget: once we have seen the plugin alive, a continuous
 # disappearance this long means it crashed and is not self-recovering.
-PLUGIN_DEAD_GRACE=180
+# Kept at 60s (was 180s): while the plugin is dead, inbound AND outbound MCP
+# (the reply tool) are unavailable and messages are lost, so a shorter grace
+# narrows that loss window. 60s stays well above a transient respawn/GC gap
+# (which recovers in seconds and resets PLUGIN_DEAD_SINCE), so it does not
+# introduce flapping, and it aligns with the dashboard-side channel-plugin
+# -unlock that already probes at ~40s.
+PLUGIN_DEAD_GRACE=60
 PLUGIN_SEEN_ONCE=false
 PLUGIN_DEAD_SINCE=0
 

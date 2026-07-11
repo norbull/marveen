@@ -17,7 +17,19 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
 
   if (path === '/api/messages' && method === 'POST') {
     const body = await readBody(req)
-    const { from, to, content } = JSON.parse(body.toString()) as { from: string; to: string; content: string }
+    // Guard the parse: a malformed JSON body (e.g. an unescaped quote/newline
+    // in a curl-inline payload) previously threw out of the handler, surfaced
+    // as a generic 500 "Web szerver hiba", and silently dropped the message.
+    // Reject it as a clean 400 so the caller sees the failure and can retry.
+    let parsed: { from?: string; to?: string; content?: string }
+    try {
+      parsed = JSON.parse(body.toString())
+    } catch {
+      logger.warn({ path }, 'Rejected /api/messages POST with malformed JSON body')
+      json(res, { error: 'malformed JSON body' }, 400)
+      return true
+    }
+    const { from, to, content } = parsed
     if (!from?.trim() || !to?.trim() || !content?.trim()) {
       json(res, { error: 'from, to, and content are required' }, 400)
       return true
