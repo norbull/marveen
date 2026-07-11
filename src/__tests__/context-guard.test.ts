@@ -12,7 +12,9 @@ import {
   type GuardState,
 } from '../context-guard.js'
 
-const CFG: ContextGuardConfig = { ...DEFAULT_CONTEXT_GUARD }
+// The guard is default-off (opt-in); these behavioural cases exercise an
+// explicitly-enabled guard.
+const CFG: ContextGuardConfig = { ...DEFAULT_CONTEXT_GUARD, enabled: true }
 const NOW = 1_000_000_000
 
 function inputs(overrides: Partial<GuardInputs> = {}): GuardInputs {
@@ -28,16 +30,17 @@ function inputs(overrides: Partial<GuardInputs> = {}): GuardInputs {
 }
 
 describe('normalizeContextGuardConfig', () => {
-  it('returns enabled defaults for garbage', () => {
+  it('returns defaults for garbage', () => {
     expect(normalizeContextGuardConfig(null)).toEqual(DEFAULT_CONTEXT_GUARD)
     expect(normalizeContextGuardConfig('nope')).toEqual(DEFAULT_CONTEXT_GUARD)
     expect(normalizeContextGuardConfig({ actPct: 'high' })).toEqual(DEFAULT_CONTEXT_GUARD)
   })
 
-  it('is default-on: only an explicit false disables', () => {
-    expect(normalizeContextGuardConfig({}).enabled).toBe(true)
-    expect(normalizeContextGuardConfig({ enabled: 0 }).enabled).toBe(true)
+  it('is default-off (opt-in): only an explicit true enables', () => {
+    expect(normalizeContextGuardConfig({}).enabled).toBe(false)
+    expect(normalizeContextGuardConfig({ enabled: 0 }).enabled).toBe(false)
     expect(normalizeContextGuardConfig({ enabled: false }).enabled).toBe(false)
+    expect(normalizeContextGuardConfig({ enabled: true }).enabled).toBe(true)
   })
 
   it('clamps hardPct to at least actPct', () => {

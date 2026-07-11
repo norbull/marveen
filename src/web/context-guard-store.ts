@@ -10,9 +10,10 @@ import {
 
 // Per-agent context-guard config in one JSON map keyed by agent name (the main
 // orchestrator included, under its agent id) -- same shape as auto-restart.json.
-// Unlike auto-restart, the guard is DEFAULT-ON: an agent with no entry gets the
-// enabled default config, so a freshly-created agent is protected without any
-// operator action (the kanban #81 requirement: "MINDEN agensnel").
+// Like auto-restart, the guard is DEFAULT-OFF (opt-in): an agent with no entry
+// is unprotected until an operator enables it. Default-off keeps the guard from
+// double-restarting against the existing context-clean path (#525) until the two
+// systems share a trigger.
 const STORE_PATH = join(PROJECT_ROOT, 'store', 'context-guard.json')
 
 function readRaw(): Record<string, unknown> {
@@ -34,7 +35,7 @@ export function readAllContextGuardConfigs(): Record<string, ContextGuardConfig>
   return out
 }
 
-/** One agent's config, normalized; the ENABLED default when unset. */
+/** One agent's config, normalized; the DISABLED default when unset. */
 export function readContextGuardConfig(name: string): ContextGuardConfig {
   const raw = readRaw()
   return name in raw ? normalizeContextGuardConfig(raw[name]) : { ...DEFAULT_CONTEXT_GUARD }

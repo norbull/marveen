@@ -15,7 +15,8 @@
 // is unit-testable. The I/O lives in src/web/context-guard-runner.ts.
 
 export interface ContextGuardConfig {
-  /** Master toggle. Default TRUE: the guard protects every agent unless opted out. */
+  /** Master toggle. Default FALSE: the guard is opt-in per agent, so it never
+   *  double-restarts against the existing context-clean path (#525). */
   enabled: boolean
   /** Context fraction at which the handoff sequence starts. */
   actPct: number
@@ -32,7 +33,7 @@ export interface ContextGuardConfig {
 }
 
 export const DEFAULT_CONTEXT_GUARD: ContextGuardConfig = {
-  enabled: true,
+  enabled: false,
   actPct: 0.90,
   hardPct: 0.97,
   limitTokens: null,
@@ -55,7 +56,7 @@ export function normalizeContextGuardConfig(raw: unknown): ContextGuardConfig {
     limitTokens = Math.floor(o.limitTokens)
   }
   return {
-    enabled: o.enabled !== false, // default-on: absent/garbage means enabled
+    enabled: o.enabled === true, // default-off (opt-in): only an explicit true enables
     actPct,
     hardPct,
     limitTokens,
