@@ -743,9 +743,28 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean; skipIde
             'plugin:telegram:telegram': buildTelegramMcpServerConfig(bunBin, pluginDir, agentChannelDir),
           },
         }
-        writeFileSync(mcpJsonPath, JSON.stringify(mcpConfig, null, 2))
+        // Idempotent write: only touch the file when the serialized content
+        // actually changes. buildTelegramMcpServerConfig is deterministic (const
+        // wrapper + bunBin + pluginDir + stateDir, no pid/timestamp), so an
+        // unconditional writeFileSync on every respawn tick rewrote mcp.json with
+        // byte-identical content -- which Claude Code detects as an MCP config
+        // change and re-inits, popping a blocking MCP picker modal into the
+        // agent pane. That parks the session (detectsBlockingMenu), so inbound
+        // Telegram is not processed and outbound replies are lost until the
+        // monitor sends a recovery Escape. Skipping the no-op write removes the
+        // re-init trigger entirely.
+        const nextMcpJson = JSON.stringify(mcpConfig, null, 2)
+        let prevMcpJson = ''
+        try {
+          prevMcpJson = readFileSync(mcpJsonPath, 'utf-8')
+        } catch {
+          // no prior file (first spawn) -- fall through to write
+        }
+        if (prevMcpJson !== nextMcpJson) {
+          writeFileSync(mcpJsonPath, nextMcpJson)
+          logger.info({ name, pluginVersion, pluginDir }, 'Wrote per-agent mcp.json for telegram plugin')
+        }
         useMcpJsonForChannel = true
-        logger.info({ name, pluginVersion, pluginDir }, 'Wrote per-agent mcp.json for telegram plugin')
       } catch (err) {
         logger.warn({ err, name }, 'Could not write mcp.json for telegram agent; falling back to --channels flag')
       }
