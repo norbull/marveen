@@ -31,6 +31,7 @@ import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
+import { tryHandleChannelSend } from './web/routes/channel-send.js'
 import { tryHandleAgentTerminal } from './web/routes/agent-terminal.js'
 import { tryHandleAgentConversation } from './web/routes/agent-conversation.js'
 import { tryHandleAgentTaskState } from './web/routes/agent-taskstate.js'
@@ -163,6 +164,7 @@ export function startWebServer(port = 3420): http.Server {
 
       if (await tryHandleProfiles(routeCtx)) return
       if (await tryHandleMessages(routeCtx)) return
+      if (await tryHandleChannelSend(routeCtx)) return
       if (await tryHandleDailyLog(routeCtx)) return
       if (await tryHandleMemories(routeCtx)) return
       if (await tryHandleMigrate(routeCtx)) return

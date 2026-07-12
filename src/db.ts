@@ -558,6 +558,28 @@ export function initDatabase(dbPathOverride?: string): void {
     )
   `)
 
+  // --- Channel Outbox (DEAD-only outbound safety net) ---
+  // A row is enqueued ONLY when an agent's channel plugin was DEAD at send
+  // time, so the reply tool could not have delivered the message (no dup risk).
+  // The drain flushes pending rows on the plugin's DEAD->HEALTHY edge, sending
+  // directly via the Bot API (plugin-independent). See src/channel-outbox.ts.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS channel_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'telegram',
+      chat_id TEXT NOT NULL,
+      text TEXT NOT NULL,
+      parse_mode TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','dropped')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      last_attempt_at INTEGER
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_channel_outbox_pending ON channel_outbox(status, agent_id, provider)`)
+
   // --- Idea Box ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS idea_box (
@@ -1764,6 +1786,76 @@ export interface AgentMessage {
   created_at: number
   delivered_at: number | null
   completed_at: number | null
+}
+
+// --- Channel Outbox (DEAD-only outbound safety net; see src/channel-outbox.ts) ---
+export interface ChannelOutboxRow {
+  id: number
+  agent_id: string
+  provider: string
+  chat_id: string
+  text: string
+  parse_mode: string | null
+  status: 'pending' | 'sent' | 'dropped'
+  attempts: number
+  last_error: string | null
+  created_at: number
+  last_attempt_at: number | null
+}
+
+/**
+ * Enqueue a Norbi-bound reply that could NOT be delivered because the agent's
+ * channel plugin was DEAD at send time. Only DEAD-time messages land here, so a
+ * later flush cannot duplicate a message the reply tool already delivered.
+ */
+export function enqueueChannelOutbox(
+  agentId: string, provider: string, chatId: string, text: string, parseMode: string | null,
+): ChannelOutboxRow {
+  const now = Math.floor(Date.now() / 1000)
+  const info = db.prepare(
+    `INSERT INTO channel_outbox (agent_id, provider, chat_id, text, parse_mode, status, attempts, created_at)
+     VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)`
+  ).run(agentId, provider, chatId, text, parseMode, now)
+  return {
+    id: Number(info.lastInsertRowid),
+    agent_id: agentId, provider, chat_id: chatId, text, parse_mode: parseMode,
+    status: 'pending', attempts: 0, last_error: null, created_at: now, last_attempt_at: null,
+  }
+}
+
+/** Pending rows for one agent+provider, oldest first (flush order). */
+export function listPendingChannelOutbox(agentId: string, provider: string): ChannelOutboxRow[] {
+  return db.prepare(
+    `SELECT * FROM channel_outbox WHERE status = 'pending' AND agent_id = ? AND provider = ? ORDER BY created_at ASC`
+  ).all(agentId, provider) as ChannelOutboxRow[]
+}
+
+/** Distinct agent+provider pairs that currently have pending rows. */
+export function pendingChannelOutboxAgents(): { agent_id: string; provider: string }[] {
+  return db.prepare(
+    `SELECT DISTINCT agent_id, provider FROM channel_outbox WHERE status = 'pending'`
+  ).all() as { agent_id: string; provider: string }[]
+}
+
+export function markChannelOutboxSent(id: number): void {
+  db.prepare(
+    `UPDATE channel_outbox SET status = 'sent', last_attempt_at = ? WHERE id = ?`
+  ).run(Math.floor(Date.now() / 1000), id)
+}
+
+export function bumpChannelOutboxAttempt(id: number, error: string): number {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(
+    `UPDATE channel_outbox SET attempts = attempts + 1, last_error = ?, last_attempt_at = ? WHERE id = ?`
+  ).run(error.slice(0, 500), now, id)
+  const row = db.prepare(`SELECT attempts FROM channel_outbox WHERE id = ?`).get(id) as { attempts: number } | undefined
+  return row?.attempts ?? 0
+}
+
+export function markChannelOutboxDropped(id: number, error: string): void {
+  db.prepare(
+    `UPDATE channel_outbox SET status = 'dropped', last_error = ?, last_attempt_at = ? WHERE id = ?`
+  ).run(error.slice(0, 500), Math.floor(Date.now() / 1000), id)
 }
 
 export function createAgentMessage(from: string, to: string, content: string): AgentMessage {

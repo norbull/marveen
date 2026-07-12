@@ -17,6 +17,7 @@ import { ensureHeartbeatAgent, shouldBootHeartbeatAgent, HEARTBEAT_AGENT_NAME } 
 import { startAgentProcess } from './web/agent-process.js'
 import { renameSharedCredentialsIfSafe } from './web/claude-credentials-guard.js'
 import { startWebServer } from './web.js'
+import { startChannelOutboxDrain, stopChannelOutboxDrain } from './channel-outbox.js'
 import { logger } from './logger.js'
 import { startInviteMonitor, stopInviteMonitor } from './web/channel-invites.js'
 import { ensureDiscordChannelGroup } from './web/discord-group-bootstrap.js'
@@ -357,6 +358,7 @@ const shutdown = (): void => {
     try { stopStoreWatcher() } catch (err) { logger.warn({ err }, 'stopStoreWatcher threw during shutdown') }
     try { stopAutoRecovery() } catch (err) { logger.warn({ err }, 'stopAutoRecovery threw during shutdown') }
     try { stopKanbanProjectsSync() } catch (err) { logger.warn({ err }, 'stopKanbanProjectsSync threw during shutdown') }
+    try { stopChannelOutboxDrain() } catch (err) { logger.warn({ err }, 'stopChannelOutboxDrain threw during shutdown') }
     if (decayInterval) clearInterval(decayInterval)
     if (digestTimer) clearTimeout(digestTimer)
     if (digestInterval) clearInterval(digestInterval)
@@ -417,6 +419,9 @@ async function main(): Promise<void> {
   runDecaySweep()
   decayInterval = setInterval(runDecaySweep, 24 * 60 * 60 * 1000)
   logger.info('Memoria leepulesi ciklus beallitva (24 oras)')
+
+  // Channel outbox drain: flush DEAD-time queued replies once plugins recover.
+  startChannelOutboxDrain()
 
   // Daily digest at 23:00. Timer handles kept so shutdown can drop them.
   function scheduleDailyDigest() {
