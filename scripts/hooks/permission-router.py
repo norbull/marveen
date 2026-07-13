@@ -28,6 +28,11 @@ import hashlib
 import urllib.request
 
 PROJECT_ROOT = "/home/karma/marveen"
+# Branch-immune runtime copy of the critical hooks (see install-critical-hooks.sh).
+# Orin's grant command must point here, not at PROJECT_ROOT/scripts/hooks: a repo
+# branch-switch can delete scripts/hooks/grant-approval.py from disk mid-run, so
+# the repo path is not safe to hand out. ~/.claude/hooks/ is branch-immune.
+RUNTIME_HOOKS = os.path.join(os.path.expanduser("~"), ".claude", "hooks")
 DASHBOARD = "http://localhost:3420"
 APPROVAL_TTL = 900        # granted approval valid 15 min
 NOTIFY_DEDUPE = 300       # don't re-ping Orin for same sig within 5 min
@@ -339,7 +344,7 @@ def ping_orin(agent, kind, payload, sig):
     content = (
         f"[Permission-kérés @{agent}] KRITIKUS művelet jóváhagyásra vár ({kind}). "
         f"sig={sig}\nParancs/tool:\n{short}\n\n"
-        f"Ha OK: futtasd `python3 {PROJECT_ROOT}/scripts/hooks/grant-approval.py {agent} {sig}` "
+        f"Ha OK: futtasd `python3 {RUNTIME_HOOKS}/grant-approval.py {agent} {sig}` "
         f"(jóváhagyja 15 percre + szól {agent}-nek hogy futtassa újra). "
         f"Kétes esetben kérdezd Norbi-t Telegramon, és csak az ő jóváhagyása után grantolj. "
         f"Default-deny: ha nem vagy biztos, NE grantolj."
