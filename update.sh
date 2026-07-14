@@ -433,6 +433,15 @@ if [ -x "$INSTALL_DIR/scripts/sync-hooks.sh" ]; then
   bash "$INSTALL_DIR/scripts/sync-hooks.sh" || echo -e "  FIGYELEM: sync-hooks.sh nem-nulla exit; manualisan ellenorizd."
 fi
 
+# Plugin patch-ek ujra-alkalmazasa frissites utan (idempotens).
+if [ -d "$INSTALL_DIR/scripts/patches" ]; then
+  for patch in "$INSTALL_DIR/scripts/patches"/*.sh; do
+    [ -x "$patch" ] || continue
+    echo -e "  Patch: $(basename "$patch")..."
+    bash "$patch" || echo -e "  FIGYELEM: $(basename "$patch") nem-nulla exit."
+  done
+fi
+
 # Graphify tudasgraf regeneralasa (best-effort). A web/icons/graphify-graph.html
 # gitignore-olt runtime artifact, ezert friss checkout utan hianyzik -> a dashboard
 # Graphify panelje 404-ezne. Ez a script ujraepiti a friss src/-bol (tree-sitter
