@@ -22,6 +22,39 @@ def kind_of(cmd, tool="Bash"):
     return r[0] if r else None
 
 
+def write_kind(path, tool="Write"):
+    r = R.is_critical(tool, {"file_path": path})
+    return r[0] if r else None
+
+
+# (label, path, expected_kind_or_None) -- Write/Edit path classification.
+# SAFE_WRITE_PATH memory carve-out vs the ~/.claude critical-write gate.
+WRITE_CASES = [
+    # --- memory carve-out: routine (None), NO Orin gate ---
+    ("orin memory MEMORY.md",
+     "/home/karma/.claude/projects/-home-karma-marveen/memory/MEMORY.md", None),
+    ("orin memory fact file",
+     "/home/karma/.claude/projects/-home-karma-marveen/memory/some-fact.md", None),
+    ("sub-agent memory file",
+     "/home/karma/marveen/agents/dex/.claude-config/projects/-home-karma-marveen/memory/x.md", None),
+
+    # --- still critical: hooks/settings under ~/.claude ---
+    ("~/.claude hook write",
+     "/home/karma/.claude/hooks/permission-router.py", "write"),
+    ("~/.claude settings.json",
+     "/home/karma/.claude/settings.json", "write"),
+    ("agent settings.local.json",
+     "/home/karma/marveen/agents/dex/.claude/settings.local.json", "write"),
+    ("/etc write", "/etc/hosts", "write"),
+
+    # --- traversal defeated by normpath: resolves OUT of memory/ -> critical ---
+    ("memory traversal to settings",
+     "/home/karma/.claude/projects/x/memory/../../settings.json", "write"),
+    ("memory traversal to hooks",
+     "/home/karma/.claude/projects/x/memory/../../../.claude/hooks/evil.py", "write"),
+]
+
+
 # (label, command, expected_kind_or_None)
 CASES = [
     # --- HTTP egress: allowlisted -> routine (None) ---
@@ -82,5 +115,13 @@ for label, cmd, expected in CASES:
         fails += 1
     print(f"[{'PASS' if ok else 'FAIL'}] {label:38} expected={expected!s:14} got={got!s}")
 
-print(f"\n{len(CASES)-fails}/{len(CASES)} passed, {fails} failed")
+for label, path, expected in WRITE_CASES:
+    got = write_kind(path)
+    ok = got == expected
+    if not ok:
+        fails += 1
+    print(f"[{'PASS' if ok else 'FAIL'}] {label:38} expected={expected!s:14} got={got!s}")
+
+total = len(CASES) + len(WRITE_CASES)
+print(f"\n{total-fails}/{total} passed, {fails} failed")
 sys.exit(1 if fails else 0)

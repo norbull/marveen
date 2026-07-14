@@ -155,6 +155,17 @@ CRITICAL_WRITE_PATH = [
     r"/\.ssh/|/\.aws/|/\.gnupg/|\.git-credentials",
     r"^/etc/",
 ]
+# Safe-write carve-out: agent MEMORY files live under .../projects/<proj>/memory/
+# and every agent is explicitly instructed (CLAUDE.md memory system) to write
+# them routinely. The main agent's memory dir is ~/.claude/projects/.../memory/,
+# which sits INSIDE the ^/home/[^/]+/\.claude/ critical zone -- so without this
+# exemption Orin's own memory writes get gated as critical and routed to itself
+# (self-deadlock / noise). Matched on the NORMALIZED path (os.path.normpath) so a
+# `.../memory/../../settings.json` traversal collapses out of the carve-out and
+# re-enters the critical set. Kept tight: one flat filename directly in memory/.
+SAFE_WRITE_PATH = [
+    r"/projects/[^/]+/memory/[^/]+$",
+]
 WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
 
@@ -292,9 +303,15 @@ def is_critical(tool, ti):
             return ("http_external", raw)
     if tool in WRITE_TOOLS:
         path = str(ti.get("file_path", "") or ti.get("notebook_path", "") or "")
-        for p in CRITICAL_WRITE_PATH:
-            if re.search(p, path):
-                return ("write", f"{tool} -> {path}")
+        norm = os.path.normpath(path) if path else path
+        # Safe-write carve-out wins over the critical-write gate: a memory-file
+        # write is routine. Traversal is defeated by normpath above -- a path
+        # that resolves out of .../memory/ no longer matches SAFE and falls
+        # through to the critical check.
+        if not any(re.search(p, norm) for p in SAFE_WRITE_PATH):
+            for p in CRITICAL_WRITE_PATH:
+                if re.search(p, norm):
+                    return ("write", f"{tool} -> {path}")
     return None
 
 
