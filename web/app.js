@@ -1246,13 +1246,28 @@ function createCardEl(card, embeddedChildren = []) {
     ? `<span class="kanban-card-project">${escapeHtml(card.project)}</span>`
     : ''
 
+  // BLOKK label: a manually-attached label named "BLOKK" (case-insensitive)
+  // surfaces as a prominent top-of-card chip — same slot/shape as the project
+  // tag, red-tinted — so a blocked card reads as blocked at a glance. It is
+  // pulled out of the footer pills below to avoid rendering it twice.
+  const blockLabel = Array.isArray(card.labels)
+    ? card.labels.find((l) => l.name && l.name.toUpperCase() === 'BLOKK')
+    : null
+  const blockHtml = blockLabel
+    ? `<span class="kanban-card-block" style="--block-color:${escapeHtml(blockLabel.color)}" title="Blokkolt">${escapeHtml(blockLabel.name)}</span>`
+    : ''
+
   // Label footer pills: at most 3 shown + a "+N" overflow indicator. Each pill
   // (except the overflow one) toggles that label into the active label-filter
   // when clicked, mirroring the priority quick-filter chips above the board.
+  // The BLOKK label is excluded here — it is rendered as the top chip above.
   let labelsHtml = ''
-  if (Array.isArray(card.labels) && card.labels.length > 0) {
-    const shown = card.labels.slice(0, 3)
-    const overflow = card.labels.length - shown.length
+  const footerLabels = Array.isArray(card.labels)
+    ? card.labels.filter((l) => !l.name || l.name.toUpperCase() !== 'BLOKK')
+    : []
+  if (footerLabels.length > 0) {
+    const shown = footerLabels.slice(0, 3)
+    const overflow = footerLabels.length - shown.length
     const pills = shown.map((l) =>
       `<span class="kanban-card-label-pill" data-label-id="${escapeHtml(l.id)}" style="--label-color:${escapeHtml(l.color)}" title="${t('kanban.label.filter_tooltip', { name: escapeHtml(l.name) })}">#${escapeHtml(l.name)}</span>`
     ).join('')
@@ -1307,7 +1322,7 @@ function createCardEl(card, embeddedChildren = []) {
   }
 
   el.innerHTML = `
-    ${projectHtml}
+    ${blockHtml}${projectHtml}
     <div class="kanban-card-title">${seqHtml}${escapeHtml(card.title)}</div>
     <div class="kanban-card-footer">${assigneeHtml}${dueHtml}</div>
     ${labelsHtml}

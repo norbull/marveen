@@ -821,6 +821,22 @@ main {
   letter-spacing: 0.02em;
 }
 
+/* BLOKK chip: same slot/shape as the project tag, red-tinted to flag a
+   blocked card. Manually attached via the "BLOKK" label; rendered at the top
+   of the card (see renderKanbanCard) instead of as a footer pill. */
+.kanban-card-block {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--block-color, #ef4444);
+  background: color-mix(in oklch, var(--block-color, #ef4444) 15%, transparent);
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  margin-right: 4px;
+  letter-spacing: 0.04em;
+}
+
 .kanban-card-title {
   font-size: 13px;
   font-weight: 500;
