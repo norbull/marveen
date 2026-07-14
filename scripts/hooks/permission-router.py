@@ -312,6 +312,22 @@ def approvals_path(agent, suffix):
     return os.path.join(d, f"{agent}.{suffix}.json")
 
 
+def cmd_snapshot_path(agent, sig):
+    """On-disk full-payload snapshot for a pending critical action.
+
+    The inline Orin ping is length-capped, so a dangerous tail past the cutoff
+    could otherwise stay hidden from the grantor while the sig/grant still apply
+    to the WHOLE command (GhostApproval pattern, Dex incident 2026-07-14).
+    grant-approval.py reads this file back and echoes it before granting.
+    """
+    d = os.path.join(PROJECT_ROOT, "store", "approvals")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, f"{agent}.{sig}.cmd")
+
+
 def load_json(path, default):
     try:
         with open(path) as f:
@@ -340,12 +356,29 @@ def ping_orin(agent, kind, payload, sig):
     tok = token()
     if not tok:
         return
-    short = payload if len(payload) <= 400 else payload[:400] + " ..."
+    # Persist the FULL payload so Orin can review exactly what will run before
+    # granting -- the inline ping below is length-capped and a dangerous tail
+    # must never hide past the cutoff (GhostApproval defense, 2026-07-14).
+    snap = cmd_snapshot_path(agent, sig)
+    try:
+        with open(snap, "w") as f:
+            f.write(payload)
+    except Exception:
+        snap = None
+    snap_ref = snap or f"store/approvals/{agent}.{sig}.cmd"
+    LIMIT = 400
+    if len(payload) <= LIMIT:
+        short = payload
+        tail_warn = ""
+    else:
+        short = payload[:LIMIT] + f"\n[TRUNCATED {len(payload) - LIMIT} char -- TELJES parancs: {snap_ref}]"
+        tail_warn = (f"FIGYELEM: a parancs csonkolva -- grant ELOTT nezd meg a teljeset: "
+                     f"cat {snap_ref}\n")
     content = (
         f"[Permission-kérés @{agent}] KRITIKUS művelet jóváhagyásra vár ({kind}). "
-        f"sig={sig}\nParancs/tool:\n{short}\n\n"
+        f"sig={sig} (SHA-256[:12])\nParancs/tool:\n{short}\n\n{tail_warn}"
         f"Ha OK: futtasd `python3 {RUNTIME_HOOKS}/grant-approval.py {agent} {sig}` "
-        f"(jóváhagyja 15 percre + szól {agent}-nek hogy futtassa újra). "
+        f"(kiirja a TELJES parancsot ellenorzesre, jóváhagyja 15 percre + szól {agent}-nek hogy futtassa újra). "
         f"Kétes esetben kérdezd Norbi-t Telegramon, és csak az ő jóváhagyása után grantolj. "
         f"Default-deny: ha nem vagy biztos, NE grantolj."
     )
@@ -397,6 +430,10 @@ def main():
         # consume single-use so a granted token can't be reused indefinitely
         appr.pop(sig, None)
         save_json(appr_path, appr)
+        try:
+            os.remove(cmd_snapshot_path(agent, sig))
+        except Exception:
+            pass
         emit("allow")
 
     # 2) route to Orin, dedupe pings

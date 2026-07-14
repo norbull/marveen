@@ -32,6 +32,20 @@ def main():
     agent, sig = sys.argv[1], sys.argv[2]
     d = os.path.join(PROJECT_ROOT, "store", "approvals")
     os.makedirs(d, exist_ok=True)
+
+    # Echo the FULL command snapshot the router persisted, so the grantor sees
+    # exactly what will run -- including any tail that was truncated in the ping
+    # (GhostApproval defense, 2026-07-14). No snapshot -> warn, grant proceeds on
+    # the sig alone (back-compat: older pings had no snapshot).
+    snap = os.path.join(d, f"{agent}.{sig}.cmd")
+    try:
+        with open(snap) as f:
+            full = f.read()
+        print(f"--- TELJES parancs jovahagyas elott (sig={sig}) ---\n{full}\n--- vege ---")
+    except Exception:
+        print(f"[figyelmeztetes] nincs parancs-snapshot ({snap}); grant a sig alapjan, vakon.",
+              file=sys.stderr)
+
     path = os.path.join(d, f"{agent}.granted.json")
     try:
         with open(path) as f:
