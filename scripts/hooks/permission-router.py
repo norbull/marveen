@@ -271,10 +271,10 @@ def git_subcmd_is_critical(cmd):
 def http_egress_critical(cmd):
     """True if cmd is a curl/wget to a non-allowlisted external host.
 
-    Only curl/wget are classified. Raw sockets (nc), interpreter fetches
-    (python -c requests, node fetch) and httpie are intentionally NOT covered
-    (documented scope limit) -- the gate catches accidents via the two
-    ubiquitous tools; the hook stays fail-open for anything it can't parse.
+    curl/wget only. The sibling gate extra_egress_critical() extends the same
+    host-allowlist model to interpreter fetches (python -c / node -e), raw
+    sockets (nc/ncat) and httpie. The hook stays fail-open for anything it
+    still can't parse.
     """
     if not re.search(r"\b(curl|wget)\b", cmd, re.I):
         return False
@@ -288,6 +288,131 @@ def http_egress_critical(cmd):
     return any(not _host_allowlisted(h) for h in hosts)
 
 
+# --- extended egress: interpreters / raw sockets / httpie --------------------
+# http_egress_critical only sees curl/wget, so an agent could exfiltrate via
+# `python -c 'requests.get(...)'`, `node -e 'fetch(...)'`, `nc host port` or the
+# httpie `http`/`https` CLI and auto-allow (F3 finding, Orin-approved 2026-07-14).
+# extra_egress_critical() applies the SAME HTTP_HOST_ALLOWLIST gate to those
+# vectors. Each call's hosts are scoped to that call (the interpreter's inline
+# code argument, or the shell segment for nc/httpie) so a host in one call
+# cannot mask a variable-host connection in another. It is deliberately
+# fail-secure: a net-capable call
+# whose target host cannot be PROVEN allowlisted is treated as critical (routed
+# to Orin, never a deadlock). Scope stays honest: only INLINE interpreter code
+# (-c / -e / -m module) is parsed, not `python script.py`; scheme-less host
+# extraction for nc/httpie is coarse (a dotted filename argument can also trip
+# the gate) -- fail-secure by design, since the fleet uses none of these for
+# egress today. The hook remains fail-open on any parse error.
+
+# Quoted hostname literal, e.g. socket.connect(("evil.com", 443)) or "localhost".
+# Requires a dotted TLD or explicit loopback so quoted module names ("https",
+# "node-fetch") and the URL string itself are not mistaken for a bare host.
+_QUOTED_HOST_RX = re.compile(
+    r"""['"]((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}|localhost|127\.0\.0\.1)['"]""",
+    re.I)
+# Scheme-less hostname anywhere in a segment (nc/httpie targets carry no
+# http:// scheme). Same dotted-TLD-or-loopback shape.
+_HOSTISH_RX = re.compile(
+    r"\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}|localhost)\b", re.I)
+
+# Python inline-code network capability. `requests`/`urllib`/... imply an HTTP
+# client; bare `socket` is NOT enough (socket.gethostname() is local) -- require
+# an actual outbound call so local diagnostics don't trip the gate.
+_PY_NET_RX = re.compile(
+    r"\b(?:urllib|urlopen|urlretrieve|requests|httpx|aiohttp|http\.client|"
+    r"httplib|pycurl|websockets?|ftplib|smtplib)\b", re.I)
+_PY_SOCKET_RX = re.compile(
+    r"\bsocket\b.*?\.(?:connect|create_connection|sendto|sendall)\b", re.S | re.I)
+# Node inline-code network capability.
+_NODE_NET_RX = re.compile(
+    r"""\bfetch\s*\(|"""
+    r"""\bhttps?\s*\.\s*(?:get|request)\b|"""
+    r"""\bnet\s*\.\s*(?:connect|createConnection)\b|"""
+    r"""require\(\s*['"](?:node:)?(?:https?|net|tls|dgram|axios|node-fetch|got|undici|request)['"]\s*\)|"""
+    r"""(?:import\b|from\b)[^;\n]*['"](?:node:)?(?:https?|net|axios|node-fetch|got|undici)['"]""",
+    re.I)
+
+
+def _egress_hosts(code):
+    """Provable hosts in interpreter code: literal URLs + quoted names."""
+    return _URL_HOST_RX.findall(code) + _QUOTED_HOST_RX.findall(code)
+
+
+# Inline-code argument of an interpreter: the quoted string after -c / -e (or a
+# single bare token). Matched WITHOUT splitting on ';' first, because Python's
+# statement separator ';' lives inside that quoted code and must stay with it.
+_INLINE_ARG = r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|\S+)"""
+
+
+def _py_code_args(cmd):
+    return re.findall(r"\bpython[0-9.]*\b[^\n]*?\s-c\s+" + _INLINE_ARG, cmd, re.I)
+
+
+def _node_code_args(cmd):
+    return re.findall(
+        r"\b(?:node|nodejs)\b[^\n]*?\s(?:-e|-p|--eval|--print)\s+" + _INLINE_ARG, cmd, re.I)
+
+
+def _py_modules(cmd):
+    # `python -m <module>`: classify the module name only, so `-m pip install
+    # requests` (pip fetching a net-named package) is NOT read as net code.
+    return re.findall(r"\bpython[0-9.]*\s+(?:-\S+\s+)*?-m\s+(\S+)", cmd, re.I)
+
+
+def _nc_is_listener(seg):
+    for tok in seg.split():
+        if tok == "--listen":
+            return True
+        if re.fullmatch(r"-[a-z]*l[a-z]*", tok, re.I):  # -l, -lv, -lnvp ...
+            return True
+    return False
+
+
+def _nc_seg_egress(seg):
+    if not re.search(r"\b(?:nc|ncat|netcat)\b", seg, re.I):
+        return False
+    return not _nc_is_listener(seg)  # listener is inbound, not egress
+
+
+def _scheme_less_hosts(seg):
+    return _URL_HOST_RX.findall(seg) + _HOSTISH_RX.findall(seg)
+
+
+def _httpie_seg(seg):
+    # `http`/`https` as the command word. A URL is `http://...` (no space); the
+    # httpie CLI is `http ` + args. Match only at segment start, after leading
+    # sudo / VAR=val assignments -- never mid-command (curl https://... is safe).
+    s = re.sub(r"^(?:sudo\s+|\w+=\S+\s+)+", "", seg.strip())
+    return bool(re.match(r"https?\s+\S", s, re.I))
+
+
+def _gate(hosts):
+    # Fail-secure: no provable host, or any host off the allowlist -> critical.
+    return not hosts or any(not _host_allowlisted(h) for h in hosts)
+
+
+def extra_egress_critical(cmd):
+    """Egress via interpreters / raw sockets / httpie -- same allowlist gate."""
+    # Interpreter inline code: parsed whole (its own ';' must not be split on).
+    for code in _py_code_args(cmd):
+        if _PY_NET_RX.search(code) or _PY_SOCKET_RX.search(code):
+            if _gate(_egress_hosts(code)):
+                return True
+    for code in _node_code_args(cmd):
+        if _NODE_NET_RX.search(code):
+            if _gate(_egress_hosts(code)):
+                return True
+    for mod in _py_modules(cmd):
+        if _PY_NET_RX.search(mod) and _gate(_egress_hosts(cmd)):
+            return True
+    # nc / httpie: per shell-segment (their args carry no inner ';').
+    for seg in re.split(r"[;&|\n]", cmd):
+        if _nc_seg_egress(seg) or _httpie_seg(seg):
+            if _gate(_scheme_less_hosts(seg)):
+                return True
+    return False
+
+
 def is_critical(tool, ti):
     if re.search(r"send_email", tool, re.I):
         return ("email", "send_email")
@@ -299,7 +424,7 @@ def is_critical(tool, ti):
                 return ("bash", raw)
         if git_subcmd_is_critical(cmd):
             return ("bash", raw)
-        if http_egress_critical(cmd):
+        if http_egress_critical(cmd) or extra_egress_critical(cmd):
             return ("http_external", raw)
     if tool in WRITE_TOOLS:
         path = str(ti.get("file_path", "") or ti.get("notebook_path", "") or "")
