@@ -433,6 +433,14 @@ if [ -x "$INSTALL_DIR/scripts/sync-hooks.sh" ]; then
   bash "$INSTALL_DIR/scripts/sync-hooks.sh" || echo -e "  FIGYELEM: sync-hooks.sh nem-nulla exit; manualisan ellenorizd."
 fi
 
+# Ops-hook self-heal (kanban #106): ha az update checkout-ja kiutotte valamelyik
+# kritikus fork-only hookot, allitsuk vissza developbol MOST, ne varjunk a
+# periodikus timerre. Idempotens; ep fajlokhoz nem nyul.
+if [ -x "$INSTALL_DIR/scripts/ops-hook-selfheal.sh" ]; then
+  echo -e "  Ops-hook self-heal ellenorzes..."
+  bash "$INSTALL_DIR/scripts/ops-hook-selfheal.sh" || echo -e "  FIGYELEM: ops-hook-selfheal nem-nulla exit."
+fi
+
 # Plugin patch-ek ujra-alkalmazasa frissites utan (idempotens).
 if [ -d "$INSTALL_DIR/scripts/patches" ]; then
   for patch in "$INSTALL_DIR/scripts/patches"/*.sh; do
