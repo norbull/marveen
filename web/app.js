@@ -1257,13 +1257,26 @@ function createCardEl(card, embeddedChildren = []) {
     ? `<span class="kanban-card-block" style="--block-color:${escapeHtml(blockLabel.color)}" title="Blokkolt">${escapeHtml(blockLabel.name)}</span>`
     : ''
 
+  // WAIT label: a label whose name starts with "WAIT" (e.g. "WAIT #153", naming
+  // the card being waited on) surfaces as an orange top-of-card chip — same
+  // slot/shape as the BLOKK chip. Also pulled out of the footer pills below.
+  const waitLabel = Array.isArray(card.labels)
+    ? card.labels.find((l) => l.name && l.name.toUpperCase().startsWith('WAIT'))
+    : null
+  const waitHtml = waitLabel
+    ? `<span class="kanban-card-wait" style="--wait-color:${escapeHtml(waitLabel.color)}" title="Várakozik">${escapeHtml(waitLabel.name)}</span>`
+    : ''
+
   // Label footer pills: at most 3 shown + a "+N" overflow indicator. Each pill
   // (except the overflow one) toggles that label into the active label-filter
   // when clicked, mirroring the priority quick-filter chips above the board.
-  // The BLOKK label is excluded here — it is rendered as the top chip above.
+  // The BLOKK and WAIT labels are excluded here — they render as top chips above.
   let labelsHtml = ''
   const footerLabels = Array.isArray(card.labels)
-    ? card.labels.filter((l) => !l.name || l.name.toUpperCase() !== 'BLOKK')
+    ? card.labels.filter((l) => {
+        const n = l.name ? l.name.toUpperCase() : ''
+        return n !== 'BLOKK' && !n.startsWith('WAIT')
+      })
     : []
   if (footerLabels.length > 0) {
     const shown = footerLabels.slice(0, 3)
@@ -1322,7 +1335,7 @@ function createCardEl(card, embeddedChildren = []) {
   }
 
   el.innerHTML = `
-    ${blockHtml}${projectHtml}
+    ${blockHtml}${waitHtml}${projectHtml}
     <div class="kanban-card-title">${seqHtml}${escapeHtml(card.title)}</div>
     <div class="kanban-card-footer">${assigneeHtml}${dueHtml}</div>
     ${labelsHtml}

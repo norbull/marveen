@@ -837,6 +837,19 @@ main {
   letter-spacing: 0.04em;
 }
 
+.kanban-card-wait {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--wait-color, #f97316);
+  background: color-mix(in oklch, var(--wait-color, #f97316) 15%, transparent);
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  margin-right: 4px;
+  letter-spacing: 0.04em;
+}
+
 .kanban-card-title {
   font-size: 13px;
   font-weight: 500;
