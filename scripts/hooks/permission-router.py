@@ -103,36 +103,51 @@ SEND_KEYS_RX = re.compile(
     r"(\btmux\s+send-keys\s+-t\s+(?:orin-channels|agent-[\w-]+)\b[^\n;&|]*?-l\s+)"
     r"('(?:[^'])*'|\"(?:[^\"\\]|\\.)*\")")
 
-# A shell / interpreter that would EXECUTE text, in command position (segment
-# start, after a pipe/;/&, or after sudo/xargs), plus command substitution.
-# When any of these is present the read-only echo/grep carve-out below is
-# skipped entirely -- the quoted text could be run (`echo "rm -rf /" | bash`,
-# `echo "..." > x.sh; bash x.sh`), so it must stay classified (fail-secure).
+# One shell assignment token: NAME=value, value optionally single/double quoted.
+_ASSIGN = r"[A-Za-z_]\w*=(?:'(?:[^'])*'|\"(?:[^\"\\]|\\.)*\"|\S*)"
+# A construct that would EXECUTE text, in command position (statement start /
+# after a pipe/;/&, optionally behind sudo/xargs and env-prefix assignments):
+# an interpreter, a bare $VAR command, eval, or command substitution. When any
+# is present the read-only carve-out below is skipped whole-command -- the
+# quoted / variable text could be run (`echo "rm -rf /" | bash`,
+# `X="rm -rf /"; $X`, `eval "$X"`), so it stays classified (fail-secure).
 _EXECUTOR_RX = re.compile(
-    r"\$\(|`|"
-    r"(?:^|[|;&]|\bsudo\s+|\bxargs\s+)\s*"
-    r"(?:eval|source|bash|sh|zsh|dash|python[0-9.]*|node|nodejs|perl|ruby)\b",
+    r"\$\(|`|\beval\b|"
+    r"(?:^|[|;&])\s*(?:sudo\s+|xargs\s+|" + _ASSIGN + r"\s+)*"
+    r"(?:source|bash|sh|zsh|dash|python[0-9.]*|node|nodejs|perl|ruby)\b|"
+    r"(?:^|[|;&])\s*(?:sudo\s+|" + _ASSIGN + r"\s+)*[\"']?\$\{?[A-Za-z_]",
     re.I)
 # Read-only text commands whose quoted arguments are DATA (printed / searched),
 # never executed.
 _READONLY_TEXT_CMD_RX = re.compile(r"^(?:echo|printf|grep|egrep|fgrep|rg)\b", re.I)
 
 
+def _blank_quoted(seg):
+    seg = re.sub(r"'(?:[^'])*'", "''", seg)
+    return re.sub(r'"(?:[^"\\]|\\.)*"', '""', seg)
+
+
 def _blank_readonly_text_quotes(cmd):
-    # Blank the quoted literals of echo/printf/grep-family segments so a critical
-    # keyword mentioned INSIDE that data (`echo "... git push ..."`, `grep
-    # "rm -rf" log`) is not a false positive. Only the quoted DATA is blanked --
-    # unquoted words and redirects (`> ~/.claude/...`) stay, so path/command
-    # based criticals still fire. Skipped whole-command when an executor is
-    # present (see _EXECUTOR_RX): there the text could run, so it stays classified.
+    # Blank quoted DATA that a critical keyword can hide inside as a false
+    # positive: (a) the RHS of a leading variable/env assignment
+    # (`MSG='{"content":"... git push ..."}'` -- a dashboard POST builds its JSON
+    # in a var then curls it to localhost), and (b) the quoted args of
+    # echo/printf/grep-family segments (`echo "... git push ..."`, `grep "rm -rf"
+    # log`). Only quoted literals are blanked -- unquoted words and redirects
+    # (`> ~/.claude/...`) stay, so path/command based criticals still fire.
+    # Skipped whole-command when an executor is present (see _EXECUTOR_RX): there
+    # the text could run, so it must stay classified (fail-secure).
     if _EXECUTOR_RX.search(cmd):
         return cmd
     out = []
     for part in re.split(r"([;&|\n]+)", cmd):
-        head = re.sub(r"^(?:\s*(?:sudo\s+|\w+=\S+\s+))*", "", part)
+        # (a) leading env/variable assignments: blank their quoted RHS.
+        part = re.sub(r"^(\s*(?:" + _ASSIGN + r"\s*)+)",
+                      lambda m: _blank_quoted(m.group(1)), part)
+        # (b) echo/printf/grep-family: quoted args are printed/searched text.
+        head = re.sub(r"^(?:\s*(?:sudo\s+|" + _ASSIGN + r"\s+))*", "", part)
         if _READONLY_TEXT_CMD_RX.match(head):
-            part = re.sub(r"'(?:[^'])*'", "''", part)
-            part = re.sub(r'"(?:[^"\\]|\\.)*"', '""', part)
+            part = _blank_quoted(part)
         out.append(part)
     return "".join(out)
 

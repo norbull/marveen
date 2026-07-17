@@ -174,6 +174,17 @@ CASES = [
     ("real git push not blanked", "git push origin develop", "bash"),
     ("echo then real git push", "echo \"note\" && git push origin main", "bash"),
     ("echo redirect into .claude still gated", "echo \"data\" > /home/karma/.claude/settings.json", "bash"),
+
+    # --- PR#2a COMMIT-2: variable-assignment RHS is DATA -> routine (no exec) ---
+    ("var-assigned message json to own API", "MSG='{\"content\":\"git push and rm -rf done\"}'; curl -s -d \"$MSG\" http://localhost:3420/api/messages", None),
+    ("var-assigned keyword then echo", "MSG=\"git push origin main\"; echo \"$MSG\"", None),
+    ("env-prefix keyword before routine cmd", "NOTE=\"cleanup rm -rf note\" cat /tmp/x", None),
+
+    # --- PR#2a COMMIT-2 security: var used by an executor -> stays critical ---
+    ("var then bare exec $X", "X=\"rm -rf /etc\"; $X", "bash"),
+    ("var then eval", "X=\"rm -rf /etc\"; eval \"$X\"", "bash"),
+    ("var then bash -c", "VAR=\"sudo rm -rf /\"; bash -c \"$VAR\"", "bash"),
+    ("env-prefix keyword before sh", "A=\"rm -rf /etc\" sh", "bash"),
 ]
 
 fails = 0
