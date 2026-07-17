@@ -122,6 +122,119 @@ export function syncFixedCostsToLedger(
   return tx(config.fixed_costs)
 }
 
+// ---- write path: per-event paid-usage charges (provider-agnostic) ----------
+// A single generation / paid API call (fal.ai image+video, Kling, OpenRouter,
+// audio, any paid provider) records one usage charge here. This is the only
+// client-request-triggered writer in the CostOps slice (the fixed-cost sync is
+// the other, timer-driven writer). It is deliberately narrow and idempotent:
+// the same charge re-posted with the same dedup ref updates in place rather than
+// double-counting, so a caller retry (e.g. after a network hiccup) is safe.
+//
+// Attribution (agent / project / deliverable) is stored as JSON in source_ref
+// so no schema migration is needed; the budget-cap enforcement phase can parse
+// or promote it to dedicated columns if it needs indexed per-project queries.
+
+export interface UsageCharge {
+  provider: string            // 'fal.ai' | 'openrouter' | 'kling' | 'seedance' | ...
+  billed_cost: number         // cost in `currency` (>= 0)
+  currency?: string           // defaults to the config currency
+  service_name?: string       // model / service, e.g. 'flux-pro', 'kling-2.1'
+  agent?: string              // attribution: which agent triggered the spend
+  project?: string            // attribution: which project / client
+  deliverable?: string        // attribution: which deliverable
+  consumed_quantity?: number  // e.g. 1 image, 5 seconds, 1200 tokens
+  consumed_unit?: string      // 'image' | 'second' | 'token' | 'call' | ...
+  confidence?: CostConfidence // default 'provider_api' if priced by the provider
+  ref?: string                // external id (generation id) for idempotency
+  occurred_at?: number        // unix seconds; defaults to `now`
+}
+
+export interface UsageChargeResult {
+  source_id: string
+  dedup_key: string
+  deduped: boolean            // true if an existing charge with this key was updated
+}
+
+function usageSourceId(provider: string): string {
+  return `usage:${provider.trim().toLowerCase()}`
+}
+
+/**
+ * Record one paid-usage charge into the ledger. Upserts a per-provider usage
+ * source and inserts (or, on dedup_key conflict, updates) one cost_line_item.
+ * Pure w.r.t. time: pass `now`. Throws on invalid input so the route returns 400.
+ */
+export function recordUsage(
+  db: Database.Database,
+  charge: UsageCharge,
+  now: number,
+): UsageChargeResult {
+  const provider = (charge.provider ?? '').trim()
+  if (!provider) throw new Error('provider is required')
+  if (typeof charge.billed_cost !== 'number' || !Number.isFinite(charge.billed_cost) || charge.billed_cost < 0) {
+    throw new Error('billed_cost must be a finite number >= 0')
+  }
+  const currency = charge.currency?.trim() || 'HUF'
+  const occurred = Number.isFinite(charge.occurred_at as number) ? (charge.occurred_at as number) : now
+  const confidence: CostConfidence = charge.confidence ?? 'provider_api'
+  const source_id = usageSourceId(provider)
+
+  // dedup_key: prefer the caller's external ref (a generation id is globally
+  // unique); otherwise derive one from attribution + timestamp so accidental
+  // exact re-posts collapse, but distinct events never do.
+  const dedup_key = charge.ref?.trim()
+    ? `usage|${provider}|${charge.ref.trim()}`
+    : `usage|${provider}|${charge.agent ?? ''}|${charge.project ?? ''}|${charge.deliverable ?? ''}|${occurred}`
+
+  const attribution = JSON.stringify({
+    agent: charge.agent ?? null,
+    project: charge.project ?? null,
+    deliverable: charge.deliverable ?? null,
+    ref: charge.ref ?? null,
+  })
+
+  const upsertSource = db.prepare(`
+    INSERT INTO cost_sources (id, name, provider, source_type, currency, active, created_at, updated_at)
+    VALUES (@id, @name, @provider, 'usage', @currency, 1, @now, @now)
+    ON CONFLICT(id) DO UPDATE SET
+      currency=excluded.currency, active=1, updated_at=excluded.updated_at
+  `)
+  const upsertLine = db.prepare(`
+    INSERT INTO cost_line_items
+      (source_id, charge_period_start, charge_period_end, charge_category, service_name,
+       usage_type, consumed_quantity, consumed_unit, billed_cost, effective_cost, currency,
+       confidence, data_freshness, source_ref, dedup_key, created_at)
+    VALUES
+      (@source_id, @occurred, @occurred, 'usage', @service_name,
+       @provider, @consumed_quantity, @consumed_unit, @billed_cost, NULL, @currency,
+       @confidence, @now, @source_ref, @dedup_key, @now)
+    ON CONFLICT(dedup_key) DO UPDATE SET
+      billed_cost=excluded.billed_cost, service_name=excluded.service_name,
+      consumed_quantity=excluded.consumed_quantity, consumed_unit=excluded.consumed_unit,
+      currency=excluded.currency, confidence=excluded.confidence,
+      data_freshness=excluded.data_freshness, source_ref=excluded.source_ref
+  `)
+
+  const tx = db.transaction((): UsageChargeResult => {
+    upsertSource.run({
+      id: source_id, name: `${provider} usage`, provider, currency, now,
+    })
+    const existing = db.prepare('SELECT id FROM cost_line_items WHERE dedup_key = ?').get(dedup_key)
+    upsertLine.run({
+      source_id, occurred,
+      service_name: charge.service_name ?? null,
+      provider,
+      consumed_quantity: charge.consumed_quantity ?? null,
+      consumed_unit: charge.consumed_unit ?? null,
+      billed_cost: charge.billed_cost,
+      currency, confidence, now,
+      source_ref: attribution, dedup_key,
+    })
+    return { source_id, dedup_key, deduped: existing != null }
+  })
+  return tx()
+}
+
 // ---- read path: deterministic monthly summary ------------------------------
 
 export interface CostSummary {

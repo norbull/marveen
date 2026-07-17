@@ -1,21 +1,24 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { writeFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { Readable } from 'node:stream'
 import { initDatabase, getDb } from '../db.js'
 import { tryHandleCosts, startCostsSyncTask } from '../web/routes/costs.js'
 import { monthWindow } from '../costops/ledger.js'
 import { COSTOPS_CONFIG_PATH } from '../costops/config.js'
 import type { RouteContext } from '../web/routes/types.js'
 
-// Minimal fake ServerResponse capturing what json() writes.
-function fakeCtx(path: string, method = 'GET'): { ctx: RouteContext; out: { status: number; body: any } } {
+// Minimal fake ServerResponse capturing what json() writes. `body`, when given,
+// is streamed as the request payload so POST handlers can readBody(req).
+function fakeCtx(path: string, method = 'GET', body?: string): { ctx: RouteContext; out: { status: number; body: any } } {
   const out: { status: number; body: any } = { status: 0, body: null }
   const res: any = {
     writeHead(status: number) { out.status = status; return res },
     end(chunk?: string) { if (chunk) out.body = JSON.parse(chunk) },
   }
   const url = new URL(`http://localhost:3420${path}`)
-  const ctx = { req: {} as any, res, path: url.pathname, method, url } as RouteContext
+  const req: any = body != null ? Readable.from([Buffer.from(body)]) : {}
+  const ctx = { req, res, path: url.pathname, method, url } as RouteContext
   return { ctx, out }
 }
 
@@ -93,6 +96,51 @@ describe('costops API (route smoke)', () => {
       startCostsSyncTask(24 * 60 * 60 * 1000) // long interval -- test only needs the immediate one-shot run
       const row = getDb().prepare("SELECT billed_cost FROM cost_line_items WHERE source_id='anthropic-max'").get() as { billed_cost: number } | undefined
       expect(row?.billed_cost).toBe(22000)
+    })
+  })
+
+  describe('POST /api/costs/usage', () => {
+    it('records a valid usage charge and returns 200 with dedup info', async () => {
+      const { ctx, out } = fakeCtx('/api/costs/usage', 'POST', JSON.stringify({
+        provider: 'fal.ai', billed_cost: 8, service_name: 'flux-pro', agent: 'iris', ref: 'gen-1',
+      }))
+      expect(await tryHandleCosts(ctx)).toBe(true)
+      expect(out.status).toBe(200)
+      expect(out.body.ok).toBe(true)
+      expect(out.body.source_id).toBe('usage:fal.ai')
+      expect(out.body.deduped).toBe(false)
+      const n = (getDb().prepare("SELECT COUNT(*) c FROM cost_line_items WHERE charge_category='usage'").get() as any).c
+      expect(n).toBe(1)
+    })
+
+    it('is idempotent: re-posting the same ref returns deduped=true and does not double-count', async () => {
+      const payload = JSON.stringify({ provider: 'fal.ai', billed_cost: 8, ref: 'gen-x' })
+      const a = fakeCtx('/api/costs/usage', 'POST', payload)
+      await tryHandleCosts(a.ctx)
+      expect(a.out.body.deduped).toBe(false)
+      const b = fakeCtx('/api/costs/usage', 'POST', payload)
+      await tryHandleCosts(b.ctx)
+      expect(b.out.body.deduped).toBe(true)
+      const n = (getDb().prepare("SELECT COUNT(*) c FROM cost_line_items").get() as any).c
+      expect(n).toBe(1)
+    })
+
+    it('rejects malformed JSON with 400', async () => {
+      const { ctx, out } = fakeCtx('/api/costs/usage', 'POST', '{not json')
+      expect(await tryHandleCosts(ctx)).toBe(true)
+      expect(out.status).toBe(400)
+    })
+
+    it('rejects a missing provider with 400', async () => {
+      const { ctx, out } = fakeCtx('/api/costs/usage', 'POST', JSON.stringify({ billed_cost: 5 }))
+      await tryHandleCosts(ctx)
+      expect(out.status).toBe(400)
+    })
+
+    it('rejects a negative billed_cost with 400', async () => {
+      const { ctx, out } = fakeCtx('/api/costs/usage', 'POST', JSON.stringify({ provider: 'fal.ai', billed_cost: -3 }))
+      await tryHandleCosts(ctx)
+      expect(out.status).toBe(400)
     })
   })
 })
