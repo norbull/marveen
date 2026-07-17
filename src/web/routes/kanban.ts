@@ -5,7 +5,7 @@ import {
   deleteKanbanCard, moveKanbanCard, archiveKanbanCard, unarchiveKanbanCard,
   getKanbanComments, addKanbanComment, getKanbanCardEvents, listKanbanProjects,
   getKanbanCard, getChildCards, getDb,
-  createAgentMessage, markKanbanCardDispatched,
+  createAgentMessage, markKanbanCardDispatched, cardHasBlockLabel,
   getKanbanSeqByIdPrefix,
   listLabels, getLabel, createLabel, updateLabel, deleteLabel,
   addLabelToCard, removeLabelFromCard, getLabelsForAllCards, getLabelsForCard,
@@ -64,6 +64,13 @@ function fireKanbanDispatch(id: string): void {
   try {
     const card = getKanbanCard(id)
     if (!card || card.dispatched_at) return
+    // A card on manual hold (BLOKK label) must not be handed to an agent, even
+    // if it is moved to in_progress -- mirrors the pickable-query exclusion so
+    // both the autonomous runner and this move-triggered path honour the hold.
+    if (cardHasBlockLabel(id)) {
+      logger.info({ id }, 'Kanban dispatch skipped: card carries BLOKK label (on hold)')
+      return
+    }
     const target = resolveKanbanDispatchTarget(card.assignee, {
       ownerName: OWNER_NAME,
       botName: BOT_NAME,

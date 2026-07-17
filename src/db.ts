@@ -1429,19 +1429,46 @@ export function getInProgressCardsForAssignee(assignee: string): { id: string; t
   ).all(assignee) as { id: string; title: string }[]
 }
 
+// The reserved label that marks a card as manually on-hold (Norbi's BLOKK
+// marker, applied with a reason comment). A blocked card must never be handed
+// to an agent automatically: the autonomous pickup + move-dispatch paths skip
+// it so the hold survives the 60s runner instead of being auto-assigned. The
+// audit/report views deliberately still SEE blocked cards -- only dispatch is
+// gated here, not visibility.
+export const BLOCK_LABEL_NAME = 'BLOKK'
+
+// True if `cardId` carries the reserved BLOCK label. Shared by every
+// dispatch-side guard so the "is this card on hold?" rule lives in one place.
+export function cardHasBlockLabel(cardId: string): boolean {
+  return db.prepare(
+    `SELECT 1 FROM kanban_card_labels kcl
+       JOIN labels l ON l.id = kcl.label_id
+      WHERE kcl.card_id = ? AND l.name = ?
+      LIMIT 1`
+  ).get(cardId, BLOCK_LABEL_NAME) !== undefined
+}
+
 // The single highest-priority, oldest not-yet-dispatched planned/waiting card
 // assigned to `assignee`, or null. Used by the autonomous task-pickup watcher.
 // dispatched_at IS NULL is the once-only guard: a card already handed to the
 // agent (even if the agent later parked it back to waiting) is never re-picked.
+// The NOT EXISTS clause excludes BLOCK-labelled cards so a manual hold is not
+// silently overridden by the runner (the durable STOP-protection fix; replaces
+// the old assignee-wipe workaround).
 export function getNextPickableCardForAssignee(assignee: string): KanbanCard | null {
   return (db.prepare(
-    `SELECT * FROM kanban_cards
-       WHERE assignee = ? AND status IN ('planned','waiting')
-         AND dispatched_at IS NULL AND archived_at IS NULL
-       ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END ASC,
-                created_at ASC
+    `SELECT * FROM kanban_cards kc
+       WHERE kc.assignee = ? AND kc.status IN ('planned','waiting')
+         AND kc.dispatched_at IS NULL AND kc.archived_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM kanban_card_labels kcl
+             JOIN labels l ON l.id = kcl.label_id
+            WHERE kcl.card_id = kc.id AND l.name = ?
+         )
+       ORDER BY CASE kc.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END ASC,
+                kc.created_at ASC
        LIMIT 1`
-  ).get(assignee) as KanbanCard | undefined) ?? null
+  ).get(assignee, BLOCK_LABEL_NAME) as KanbanCard | undefined) ?? null
 }
 
 // Stamp the once-only kanban -> agent dispatch guard. Returns false if the
