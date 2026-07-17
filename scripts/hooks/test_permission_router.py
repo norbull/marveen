@@ -153,6 +153,27 @@ CASES = [
     ("git status", "git status", None),
     ("cat file", "cat /home/karma/marveen/store/dashboard.log", None),
     ("systemctl is-active (read-only)", "systemctl is-active orin-dashboard", None),
+
+    # --- PR#2a COMMIT-1: IPv6 loopback (::1) provably-allowlisted ---
+    ("curl ::1 bracketed dashboard", "curl -s http://[::1]:3420/api/messages", None),
+    ("py urllib ::1 bracketed", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://[::1]:3420/api/x\")'", None),
+    ("py socket ::1 literal", "python3 -c 'import socket; socket.create_connection((\"::1\", 3420))'", None),
+    ("curl ::1 external host still gated", "curl -s http://[2001:db8::1]:80/x", "http_external"),
+
+    # --- PR#2a COMMIT-2: read-only echo/grep keyword substring -> routine ---
+    ("echo mentions git push", "echo \"=== git push deny rules ===\"", None),
+    ("echo git push origin main text", "echo 'git push origin main'", None),
+    ("grep pattern git push in log", "grep -n \"git push\" /var/log/app.log", None),
+    ("echo mentions rm -rf as topic", "echo \"cleanup step uses rm -rf carefully\"", None),
+    ("printf mentions sudo as topic", "printf '%s\\n' \"needs sudo to run\"", None),
+
+    # --- PR#2a COMMIT-2 security: executor present -> stays critical (fail-secure) ---
+    ("echo rm piped to bash", "echo \"rm -rf /etc\" | bash", "bash"),
+    ("echo to script then run", "echo \"sudo rm -rf /\" > /tmp/x.sh; bash /tmp/x.sh", "bash"),
+    ("echo cmd-subst stays", "X=$(echo \"rm -rf /etc\"); eval \"$X\"", "bash"),
+    ("real git push not blanked", "git push origin develop", "bash"),
+    ("echo then real git push", "echo \"note\" && git push origin main", "bash"),
+    ("echo redirect into .claude still gated", "echo \"data\" > /home/karma/.claude/settings.json", "bash"),
 ]
 
 fails = 0

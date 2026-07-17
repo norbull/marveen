@@ -103,6 +103,39 @@ SEND_KEYS_RX = re.compile(
     r"(\btmux\s+send-keys\s+-t\s+(?:orin-channels|agent-[\w-]+)\b[^\n;&|]*?-l\s+)"
     r"('(?:[^'])*'|\"(?:[^\"\\]|\\.)*\")")
 
+# A shell / interpreter that would EXECUTE text, in command position (segment
+# start, after a pipe/;/&, or after sudo/xargs), plus command substitution.
+# When any of these is present the read-only echo/grep carve-out below is
+# skipped entirely -- the quoted text could be run (`echo "rm -rf /" | bash`,
+# `echo "..." > x.sh; bash x.sh`), so it must stay classified (fail-secure).
+_EXECUTOR_RX = re.compile(
+    r"\$\(|`|"
+    r"(?:^|[|;&]|\bsudo\s+|\bxargs\s+)\s*"
+    r"(?:eval|source|bash|sh|zsh|dash|python[0-9.]*|node|nodejs|perl|ruby)\b",
+    re.I)
+# Read-only text commands whose quoted arguments are DATA (printed / searched),
+# never executed.
+_READONLY_TEXT_CMD_RX = re.compile(r"^(?:echo|printf|grep|egrep|fgrep|rg)\b", re.I)
+
+
+def _blank_readonly_text_quotes(cmd):
+    # Blank the quoted literals of echo/printf/grep-family segments so a critical
+    # keyword mentioned INSIDE that data (`echo "... git push ..."`, `grep
+    # "rm -rf" log`) is not a false positive. Only the quoted DATA is blanked --
+    # unquoted words and redirects (`> ~/.claude/...`) stay, so path/command
+    # based criticals still fire. Skipped whole-command when an executor is
+    # present (see _EXECUTOR_RX): there the text could run, so it stays classified.
+    if _EXECUTOR_RX.search(cmd):
+        return cmd
+    out = []
+    for part in re.split(r"([;&|\n]+)", cmd):
+        head = re.sub(r"^(?:\s*(?:sudo\s+|\w+=\S+\s+))*", "", part)
+        if _READONLY_TEXT_CMD_RX.match(head):
+            part = re.sub(r"'(?:[^'])*'", "''", part)
+            part = re.sub(r'"(?:[^"\\]|\\.)*"', '""', part)
+        out.append(part)
+    return "".join(out)
+
 
 def clean_cmd(cmd):
     # Drop curl/wget data payloads (-d/--data '...') before classifying: an
@@ -141,6 +174,9 @@ def clean_cmd(cmd):
             return m.group(1) + inner + ")"
         cmd = re.sub(r"((?:--data(?:-raw|-binary)?|-d)\s+@<\()([^)]*)\)",
                      _blank_quotes, cmd)
+    # Read-only echo/grep quoted text: blank keyword substrings (fail-secure if
+    # the command could execute -- see _blank_readonly_text_quotes).
+    cmd = _blank_readonly_text_quotes(cmd)
     return cmd
 
 
@@ -181,6 +217,7 @@ WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
 HTTP_HOST_ALLOWLIST = [
     "localhost",
     "127.0.0.1",
+    "::1",                                 # IPv6 loopback (bracketed [::1] in URLs)
     "github.com",                          # + api.github.com via suffix match
     "githubusercontent.com",               # raw./objects. github user content
     "api.telegram.org",                    # Telegram reply workaround curls
@@ -192,11 +229,13 @@ HTTP_HOST_ALLOWLIST = [
     "openrouter.ai",                       # OpenRouter free-layer draft (dex pilot)
 ]
 
-_URL_HOST_RX = re.compile(r"https?://([^/:?#\s'\"]+)", re.I)
+# Host = a bracketed IPv6 literal ([::1]) OR a normal host (stops at :/?#).
+_URL_HOST_RX = re.compile(r"https?://(\[[^\]\s]+\]|[^/:?#\s'\"]+)", re.I)
 
 
 def _host_allowlisted(host):
-    host = host.lower()
+    # Strip the brackets of an IPv6 URL host ([::1] -> ::1) before comparing.
+    host = host.lower().strip("[]")
     for entry in HTTP_HOST_ALLOWLIST:
         if host == entry or host.endswith("." + entry):
             return True
@@ -308,7 +347,7 @@ def http_egress_critical(cmd):
 # Requires a dotted TLD or explicit loopback so quoted module names ("https",
 # "node-fetch") and the URL string itself are not mistaken for a bare host.
 _QUOTED_HOST_RX = re.compile(
-    r"""['"]((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}|localhost|127\.0\.0\.1)['"]""",
+    r"""['"]((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}|localhost|127\.0\.0\.1|::1)['"]""",
     re.I)
 # Scheme-less hostname anywhere in a segment (nc/httpie targets carry no
 # http:// scheme). Same dotted-TLD-or-loopback shape.
