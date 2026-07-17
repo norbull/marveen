@@ -39,6 +39,42 @@ it never fabricates numbers and never blocks the rest of the app.
 }
 ```
 
+## Cost circuit-breaker (enforcement core)
+
+`circuit-breaker.ts` is the client-deliverable governance enforcement layer for
+**paid generation**. Unlike the display-only monthly budget above, these caps are
+meant to be **enforced before a paid generation** by the future generation
+pipeline (no such pipeline exists in this repo yet -- the core stands ready and
+fully unit-tested, wired to nothing). Pure decision logic + a small
+`deliverable_attempts` ledger; `db`/`now` passed in.
+
+Four responsibilities:
+
+- **retry cap** -- `evaluateRetry`: `max_retries` retries per deliverable, then
+  the next failure returns `hold_awaiting_approval`.
+- **fail classification** -- `classifyFail`: the same `client_id` + `fail_code`
+  reaching `systematic_threshold` is systematic (pull in a human, stop retrying).
+- **budget cap** -- `checkBudget`: provider-agnostic paid spend, aggregated from
+  the raw `cost_line_items` (not the monthly summary): today's total vs
+  `daily_cap` and a project's cumulative total vs `project_cap`, in `currency`.
+  Returns `hard_hold` when either cap is reached.
+- **model fallback** -- `modelFallback`: a consistently failing model is never
+  auto-swapped; it escalates to Orin (`orin_decision`).
+
+Decisions resolve to one enum (`allow | retry | hold_awaiting_approval |
+hard_hold | orin_decision`). `hold_awaiting_approval` maps onto the EXISTING
+kanban mechanism (card `waiting` + BLOKK label + comment) -- no new status.
+
+`FAIL_CODES` in `circuit-breaker.ts` is the canonical code home for the Iris
+QC-rubric fail taxonomy (11 codes); keep it in sync with the rubric doc.
+
+Caps live in the same local config under a `circuit_breaker` block (defaults:
+`daily_cap` 5, `project_cap` 20 USD, `max_retries` 2, `systematic_threshold` 2):
+
+```json
+"circuit_breaker": { "currency": "USD", "daily_cap": 5, "project_cap": 20, "max_retries": 2, "systematic_threshold": 2 }
+```
+
 ## API (Bearer-gated, read-only)
 
 - `GET /api/costs/summary` -- monthly spend, forecast, per-source and confidence

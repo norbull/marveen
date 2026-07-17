@@ -56,11 +56,36 @@ export interface BudgetEntry {
   hard_threshold?: number     // fraction, default 1.0
 }
 
+// Cost circuit-breaker caps. Separate from the display-only monthly BudgetEntry:
+// these are ENFORCED before a paid generation and use a different aggregation
+// (per-DAY total spend + per-PROJECT cumulative spend, provider-agnostic, in
+// `currency`). Consumed by costops/circuit-breaker.ts. Every field is optional
+// in the JSON; missing fields fall back to DEFAULT_CIRCUIT_BREAKER.
+export interface CircuitBreakerConfig {
+  currency: string             // caps + eligible usage-line currency (default 'USD')
+  daily_cap: number            // total paid spend/day before hard-hold (default 5)
+  project_cap: number          // cumulative paid spend/project before hard-hold (default 20)
+  max_retries: number          // retries allowed per deliverable; the next fail holds (default 2)
+  systematic_threshold: number // same client+fail_code count that flags systematic (default 2)
+}
+
+export const DEFAULT_CIRCUIT_BREAKER: CircuitBreakerConfig = {
+  currency: 'USD',
+  daily_cap: 5,
+  project_cap: 20,
+  max_retries: 2,
+  systematic_threshold: 2,
+}
+
 export interface CostOpsConfig {
   version: number
   currency: string
   fixed_costs: FixedCostEntry[]
   budgets: BudgetEntry[]
+  // Optional in a hand-written config object, but loadCostopsConfig always
+  // populates it (defaults when the JSON omits the block) -- resolve via
+  // resolveCircuitBreaker() at any call site to be safe.
+  circuit_breaker?: CircuitBreakerConfig
 }
 
 const EMPTY_CONFIG: CostOpsConfig = {
@@ -68,6 +93,7 @@ const EMPTY_CONFIG: CostOpsConfig = {
   currency: 'HUF',
   fixed_costs: [],
   budgets: [],
+  circuit_breaker: { ...DEFAULT_CIRCUIT_BREAKER },
 }
 
 // Safe skeleton with placeholder (zero) values -- contains no real amounts,
@@ -86,6 +112,9 @@ const EXAMPLE_CONFIG = {
   budgets: [
     { id: 'global-monthly', name: 'Global monthly', scope: 'global', amount: 0, warning_threshold: 0.8, hard_threshold: 1.0 },
   ],
+  circuit_breaker: {
+    currency: 'USD', daily_cap: 5, project_cap: 20, max_retries: 2, systematic_threshold: 2,
+  },
 }
 
 export interface ConfigLoadResult {
@@ -173,9 +202,39 @@ export function validateConfig(raw: unknown): ConfigLoadResult {
     })
   }
 
+  const circuit_breaker = parseCircuitBreaker(obj.circuit_breaker, errors)
+
   return {
-    config: { version: typeof obj.version === 'number' ? obj.version : 1, currency, fixed_costs, budgets },
+    config: { version: typeof obj.version === 'number' ? obj.version : 1, currency, fixed_costs, budgets, circuit_breaker },
     exists: true,
     errors,
+  }
+}
+
+// Parse the optional circuit_breaker block. A missing block yields the defaults;
+// a present-but-invalid field falls back to its default with an error note, so a
+// typo can never silently disable the cap or throw.
+function parseCircuitBreaker(raw: unknown, errors: string[]): CircuitBreakerConfig {
+  if (raw === undefined || raw === null) return { ...DEFAULT_CIRCUIT_BREAKER }
+  if (typeof raw !== 'object') {
+    errors.push('circuit_breaker: must be an object')
+    return { ...DEFAULT_CIRCUIT_BREAKER }
+  }
+  const c = raw as Record<string, unknown>
+  const num = (key: keyof CircuitBreakerConfig, def: number): number => {
+    const v = c[key]
+    if (v === undefined) return def
+    if (typeof v !== 'number' || !isFinite(v) || v < 0) {
+      errors.push(`circuit_breaker.${key}: must be a non-negative number`)
+      return def
+    }
+    return v
+  }
+  return {
+    currency: typeof c.currency === 'string' && c.currency ? c.currency : DEFAULT_CIRCUIT_BREAKER.currency,
+    daily_cap: num('daily_cap', DEFAULT_CIRCUIT_BREAKER.daily_cap),
+    project_cap: num('project_cap', DEFAULT_CIRCUIT_BREAKER.project_cap),
+    max_retries: num('max_retries', DEFAULT_CIRCUIT_BREAKER.max_retries),
+    systematic_threshold: num('systematic_threshold', DEFAULT_CIRCUIT_BREAKER.systematic_threshold),
   }
 }

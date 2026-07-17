@@ -724,6 +724,24 @@ export function initDatabase(dbPathOverride?: string): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cost_line_items_period ON cost_line_items(charge_period_start, charge_period_end)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cost_line_items_source ON cost_line_items(source_id)`)
 
+  // --- Cost circuit-breaker: per-deliverable attempt/fail history ---
+  // Feeds the pure decision core in costops/circuit-breaker.ts (retry cap +
+  // systematic-fail classification). One row per generation attempt: fail_code
+  // NULL = success, otherwise one of the Iris QC fail-taxonomy codes. Provider-
+  // agnostic; budget aggregation reads cost_line_items, not this table.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS deliverable_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id TEXT NOT NULL,
+      deliverable TEXT NOT NULL,
+      attempt_no INTEGER NOT NULL,
+      fail_code TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_deliverable_attempts_deliverable ON deliverable_attempts(client_id, deliverable)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_deliverable_attempts_failcode ON deliverable_attempts(client_id, fail_code)`)
+
   // --- Vault SSH Keys (shared pool) ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS vault_ssh_keys (
