@@ -45,6 +45,87 @@ export function resolveTemplatePlaceholders(content: string): string {
   })
 }
 
+// Extract the hook script's basename from a command string, e.g.
+// "python3 /a/b/permission-router.py" -> "permission-router.py". Returns null
+// for commands with no script-file token (an inline shell command), which then
+// fall back to exact-string dedup. This is the key to path-INDEPENDENT dedup:
+// the same script seeded from the repo path and later rewritten to the runtime
+// path (install-critical-hooks.sh) share a basename but not a command string.
+export function hookScriptBasename(command: string): string | null {
+  for (const tok of command.trim().split(/\s+/)) {
+    if (/\.(py|mjs|cjs|js|sh)$/.test(tok)) {
+      const slash = tok.lastIndexOf('/')
+      return slash >= 0 ? tok.slice(slash + 1) : tok
+    }
+  }
+  return null
+}
+
+type HookLeaf = { command?: string; timeout?: number; [k: string]: unknown }
+type HookEntry = { hooks?: HookLeaf[]; [k: string]: unknown }
+
+// Merge the template's hook block into an existing hook block in place, adding
+// only the hooks the existing settings lack. Dedup is path-INDEPENDENT for
+// script hooks (by basename): a router seeded at the repo path is never
+// re-added when the settings already carry the same router rewritten to the
+// runtime path -- the 2026-07-17 dupla-router root cause (two PreToolUse '*'
+// routers -> every grant blocked). Non-script (inline) commands fall back to
+// exact-string dedup. Returns true if anything changed.
+export function mergeHookBlocks(
+  existingHooks: Record<string, unknown>,
+  tplHooks: Record<string, unknown>,
+): boolean {
+  let changed = false
+  for (const [event, handlers] of Object.entries(tplHooks)) {
+    if (!existingHooks[event]) {
+      // Event entirely missing: add it wholesale.
+      existingHooks[event] = handlers
+      changed = true
+      continue
+    }
+    const tplEntries = handlers as HookEntry[]
+    const existEntries = existingHooks[event] as HookEntry[]
+    // Commands already present -- by exact string AND by script basename.
+    const existingCommands = new Set(
+      existEntries.flatMap((e) => (e.hooks ?? []).map((h) => h.command).filter(Boolean)),
+    )
+    const existingScriptBasenames = new Set(
+      existEntries.flatMap((e) =>
+        (e.hooks ?? [])
+          .map((h) => (h.command ? hookScriptBasename(h.command) : null))
+          .filter((b): b is string => Boolean(b)),
+      ),
+    )
+    for (const tplEntry of tplEntries) {
+      // Add hooks that are missing (new group entry, preserving sibling hooks).
+      const newHooks = (tplEntry.hooks ?? []).filter((h) => {
+        if (!h.command) return false
+        if (existingCommands.has(h.command)) return false // exact match already present
+        const base = hookScriptBasename(h.command)
+        if (base && existingScriptBasenames.has(base)) return false // same script, different path
+        return true
+      })
+      if (newHooks.length > 0) {
+        existEntries.push({ ...tplEntry, hooks: newHooks })
+        changed = true
+      }
+      // Sync timeouts for hooks that already exist (exact command) with a stale timeout.
+      for (const tplHook of tplEntry.hooks ?? []) {
+        if (!tplHook.command || tplHook.timeout == null) continue
+        for (const existEntry of existEntries) {
+          for (const existHook of existEntry.hooks ?? []) {
+            if (existHook.command === tplHook.command && existHook.timeout !== tplHook.timeout) {
+              existHook.timeout = tplHook.timeout
+              changed = true
+            }
+          }
+        }
+      }
+    }
+  }
+  return changed
+}
+
 // Return the settings.json path for an agent.
 // The main agent's settings live at ~/.claude/settings.json (not inside agents/).
 // Exported so the startup self-heal (hook-registration-guard) can prune stale
@@ -77,51 +158,15 @@ export function ensureAgentHooks(name: string): boolean {
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const tplHooks = tpl.hooks as Record<string, unknown>
-  type HookEntry = { hooks?: Array<{ command?: string; timeout?: number; [k: string]: unknown }> }
   if (existing.hooks) {
-    // Merge strategy:
-    //   1. If a hook event is entirely missing: add it wholesale.
-    //   2. If the event exists: add any template hook commands not yet present
-    //      as a new hook group entry (preserves existing hooks like telegram_progress.py).
-    //   3. Sync the timeout of any command hook whose command matches but timeout differs.
-    const existingHooks = existing.hooks as Record<string, unknown>
-    let changed = false
-    for (const [event, handlers] of Object.entries(tplHooks)) {
-      if (!existingHooks[event]) {
-        existingHooks[event] = handlers
-        changed = true
-      } else {
-        const tplEntries = handlers as HookEntry[]
-        const existEntries = existingHooks[event] as HookEntry[]
-        // Collect all command strings already present in this event's hook groups.
-        const existingCommands = new Set(
-          existEntries.flatMap((e) => (e.hooks ?? []).map((h) => h.command).filter(Boolean)),
-        )
-        for (const tplEntry of tplEntries) {
-          // Add hooks that are missing (as a new group entry, preserving sibling hooks).
-          const newHooks = (tplEntry.hooks ?? []).filter(
-            (h) => h.command && !existingCommands.has(h.command),
-          )
-          if (newHooks.length > 0) {
-            existEntries.push({ ...tplEntry, hooks: newHooks })
-            changed = true
-          }
-          // Sync timeouts for hooks that already exist with a stale timeout.
-          for (const tplHook of tplEntry.hooks ?? []) {
-            if (!tplHook.command || tplHook.timeout == null) continue
-            for (const existEntry of existEntries) {
-              for (const existHook of existEntry.hooks ?? []) {
-                if (existHook.command === tplHook.command && existHook.timeout !== tplHook.timeout) {
-                  existHook.timeout = tplHook.timeout
-                  changed = true
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    if (!changed) return false
+    // Merge strategy (see mergeHookBlocks):
+    //   1. Missing event: add it wholesale.
+    //   2. Existing event: add template hooks not yet present -- dedup is
+    //      path-INDEPENDENT for script hooks (by basename), so a router seeded
+    //      at the repo path is not re-added when the settings already carry the
+    //      same router at the runtime path (dupla-router root cause).
+    //   3. Sync the timeout of any exact-command hook whose timeout differs.
+    if (!mergeHookBlocks(existing.hooks as Record<string, unknown>, tplHooks)) return false
   } else {
     existing.hooks = tplHooks
   }
