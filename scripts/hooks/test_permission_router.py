@@ -17,13 +17,16 @@ R = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(R)
 
 
-def kind_of(cmd, tool="Bash"):
-    r = R.is_critical(tool, {"command": cmd})
+def kind_of(cmd, tool="Bash", agent="dex"):
+    r = R.is_critical(tool, {"command": cmd}, agent)
     return r[0] if r else None
 
 
-def write_kind(path, tool="Write"):
-    r = R.is_critical(tool, {"file_path": path})
+def write_kind(path, tool="Write", agent="dex", extra=None):
+    ti = {"file_path": path}
+    if extra:
+        ti.update(extra)
+    r = R.is_critical(tool, ti, agent)
     return r[0] if r else None
 
 
@@ -187,6 +190,104 @@ CASES = [
     ("env-prefix keyword before sh", "A=\"rm -rf /etc\" sh", "bash"),
 ]
 
+# --- deliverable write-gate + validated-flip (governance PR#2b) --------------
+# These drive is_critical() against a real on-disk client tree (the gate hashes
+# master files), so they build fixtures in a tempdir and tear them down after.
+import tempfile, json as _json, shutil
+
+_TMP_ROOTS = []
+
+
+def _sha_bytes(b):
+    import hashlib as _h
+    return _h.sha256(b).hexdigest()
+
+
+def build_client(status="validated", drift=False, with_lock=True, lock_in_04=True):
+    """A client tree with 04_Brand/logo.png master + a brand.lock pinning it,
+    and an empty 05_Website deliverable zone. drift=True mutates the master
+    AFTER recording its hash so the recorded sha no longer matches disk."""
+    base = tempfile.mkdtemp(prefix="wtgate_")
+    _TMP_ROOTS.append(base)
+    root = os.path.join(base, "clients", "Acme")  # the gate keys on /clients/<X>/
+    os.makedirs(root)
+    brand = os.path.join(root, "04_Brand")
+    os.makedirs(brand)
+    os.makedirs(os.path.join(root, "05_Website"))
+    master = os.path.join(brand, "logo.png")
+    with open(master, "wb") as f:
+        f.write(b"MASTER-BYTES")
+    sha = _sha_bytes(b"MASTER-BYTES")
+    if drift:
+        with open(master, "wb") as f:
+            f.write(b"CHANGED-BYTES-AFTER-APPROVAL")
+    if with_lock:
+        lock = {"version": 1, "status": status,
+                "master_refs": [{"path": "04_Brand/logo.png", "sha256": sha, "role": "logo"}],
+                "validated_by": "orin", "validated_at": "2026-01-01T00:00:00Z"}
+        lock_dir = brand if lock_in_04 else root
+        with open(os.path.join(lock_dir, "brand.lock.json"), "w") as f:
+            _json.dump(lock, f)
+    return root
+
+
+def _deliverable(root):
+    return os.path.join(root, "05_Website", "index.html")
+
+
+def _lock_path(root, in_04=True):
+    return os.path.join(root, "04_Brand" if in_04 else "", "brand.lock.json")
+
+
+# Build the fixtures up-front so labels can reference concrete paths.
+_r_validated = build_client("validated")
+_r_frozen = build_client("frozen")
+_r_draft = build_client("draft")
+_r_drift = build_client("validated", drift=True)
+_r_nolock = build_client(with_lock=False)
+_r_rootlock = build_client("validated", lock_in_04=False)
+_r_flip = build_client("draft")  # a draft lock a sub-agent might try to validate
+
+_VALIDATED_CONTENT = _json.dumps({"version": 1, "status": "validated",
+                                  "master_refs": [], "validated_by": "dex",
+                                  "validated_at": "2026-01-01T00:00:00Z"})
+_DRAFT_CONTENT = _json.dumps({"version": 1, "status": "draft", "master_refs": []})
+
+# (label, callable -> got, expected)
+GATE_CASES = [
+    ("deliverable: validated+match -> allow",
+     lambda: write_kind(_deliverable(_r_validated)), None),
+    ("deliverable: frozen+match -> allow",
+     lambda: write_kind(_deliverable(_r_frozen)), None),
+    ("deliverable: draft -> deny",
+     lambda: write_kind(_deliverable(_r_draft)), "write"),
+    ("deliverable: sha-drift -> deny",
+     lambda: write_kind(_deliverable(_r_drift)), "write"),
+    ("deliverable: no brand.lock -> passthrough",
+     lambda: write_kind(_deliverable(_r_nolock)), None),
+    ("deliverable: lock at client root -> allow",
+     lambda: write_kind(_deliverable(_r_rootlock)), None),
+    ("non-clients path -> passthrough",
+     lambda: write_kind("/home/karma/marveen/scratch/out.html"), None),
+    ("Edit into deliverable draft -> deny",
+     lambda: write_kind(_deliverable(_r_draft), tool="Edit",
+                        extra={"new_string": "<p>x</p>"}), "write"),
+    # --- validated-flip: Orin-only ---
+    ("flip: sub-agent Write validated -> deny",
+     lambda: write_kind(_lock_path(_r_flip), agent="dex",
+                        extra={"content": _VALIDATED_CONTENT}), "write"),
+    ("flip: orin Write validated -> allow",
+     lambda: write_kind(_lock_path(_r_flip), agent="orin",
+                        extra={"content": _VALIDATED_CONTENT}), None),
+    ("flip: sub-agent Write draft (no flip) -> allow",
+     lambda: write_kind(_lock_path(_r_flip), agent="dex",
+                        extra={"content": _DRAFT_CONTENT}), None),
+    ("flip: sub-agent Edit status->validated -> deny",
+     lambda: write_kind(_lock_path(_r_flip), agent="dex", tool="Edit",
+                        extra={"new_string": '"status": "validated",'}), "write"),
+]
+
+
 fails = 0
 for label, cmd, expected in CASES:
     got = kind_of(cmd)
@@ -202,6 +303,16 @@ for label, path, expected in WRITE_CASES:
         fails += 1
     print(f"[{'PASS' if ok else 'FAIL'}] {label:38} expected={expected!s:14} got={got!s}")
 
-total = len(CASES) + len(WRITE_CASES)
+for label, fn, expected in GATE_CASES:
+    got = fn()
+    ok = got == expected
+    if not ok:
+        fails += 1
+    print(f"[{'PASS' if ok else 'FAIL'}] {label:38} expected={expected!s:14} got={got!s}")
+
+for _root in _TMP_ROOTS:
+    shutil.rmtree(_root, ignore_errors=True)
+
+total = len(CASES) + len(WRITE_CASES) + len(GATE_CASES)
 print(f"\n{total-fails}/{total} passed, {fails} failed")
 sys.exit(1 if fails else 0)

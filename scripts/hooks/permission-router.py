@@ -467,7 +467,118 @@ def extra_egress_critical(cmd):
     return False
 
 
-def is_critical(tool, ti):
+# --- client deliverable write-gate (governance PR#2) -------------------------
+# A Write/Edit into a client DELIVERABLE zone (05_Website / 06_Video /
+# 07_Social / 99_Deliverables) is only routine when the client's brand.lock.json
+# is `validated`/`frozen` AND every pinned master still hashes to its recorded
+# sha256 (no drift). Otherwise the deliverable would be built against unapproved
+# or drifted masters -> route to Orin. See docs/client-deliverable-governance.md.
+#
+# FAIL-SAFE (passthrough, None): path is not in a deliverable zone, OR the client
+# has no brand.lock.json at all (governance not configured for this client).
+# FAIL-SECURE (gate, "write"): a lock exists but is draft/frozen-drifted/
+# unreadable/malformed -- a present-but-unprovable lock must not silently allow.
+DELIVERABLE_RX = re.compile(
+    r"^(.*/clients/[^/]+)/(?:05_Website|06_Video|07_Social|99_Deliverables)/")
+# brand.lock.json anywhere under a client root (conventionally in 04_Brand/).
+BRAND_LOCK_PATH_RX = re.compile(r"/clients/[^/]+/(?:[^/]+/)*brand\.lock\.json$")
+# A status escalation to validated/frozen in the INCOMING write text. Flipping a
+# lock out of draft is an approval action reserved for the main agent (Orin);
+# a sub-agent must not self-approve its own brand masters.
+STATUS_FLIP_RX = re.compile(r"""["']status["']\s*:\s*["'](?:validated|frozen)["']""")
+_LOCK_OK_STATUS = ("validated", "frozen")
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _lock_validated_and_clean(lock, client_root):
+    """True only if the lock is validated/frozen and every master_ref hashes to
+    its recorded sha256 (no drift, no missing master, no traversal)."""
+    if not isinstance(lock, dict) or lock.get("status") not in _LOCK_OK_STATUS:
+        return False
+    refs = lock.get("master_refs")
+    if not isinstance(refs, list):
+        return False
+    for ref in refs:
+        if not isinstance(ref, dict):
+            return False
+        rel, recorded = ref.get("path"), ref.get("sha256")
+        if not isinstance(rel, str) or not isinstance(recorded, str):
+            return False
+        # reject abs / traversal exactly like validate-brand-lock.py
+        if os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
+            return False
+        disk = os.path.normpath(os.path.join(client_root, rel))
+        try:
+            if _sha256_file(disk) != recorded:
+                return False
+        except OSError:
+            return False  # master missing/unreadable -> treat as drift
+    return True
+
+
+def _find_brand_lock(client_root):
+    for cand in (os.path.join(client_root, "04_Brand", "brand.lock.json"),
+                 os.path.join(client_root, "brand.lock.json")):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _deliverable_write_gate(norm):
+    m = DELIVERABLE_RX.match(norm)
+    if not m:
+        return None  # not a deliverable-zone write -> passthrough
+    client_root = m.group(1)
+    lock_path = _find_brand_lock(client_root)
+    if lock_path is None:
+        return None  # governance not configured for this client -> passthrough
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            lock = json.load(f)
+    except Exception:
+        return ("write", f"deliverable write blocked -- unreadable brand.lock: {lock_path}")
+    if _lock_validated_and_clean(lock, client_root):
+        return None  # validated/frozen + no drift -> routine
+    return ("write", f"deliverable write blocked -- brand.lock not validated or drifted: {lock_path}")
+
+
+def _incoming_write_texts(tool, ti):
+    """Every free-text body an incoming write would land on disk (content for
+    Write, new_string for Edit, each edit's new_string for MultiEdit)."""
+    texts = []
+    if tool == "Write":
+        texts.append(str(ti.get("content", "") or ""))
+    else:
+        ns = ti.get("new_string")
+        if ns is not None:
+            texts.append(str(ns))
+        for e in (ti.get("edits") or []):
+            if isinstance(e, dict) and e.get("new_string") is not None:
+                texts.append(str(e.get("new_string")))
+    return texts
+
+
+def _brand_lock_flip_gate(tool, ti, norm, agent):
+    """Sub-agent flipping a brand.lock to validated/frozen -> critical (Orin-only
+    approval action). Orin (MAIN_AGENT) may flip freely."""
+    if agent == MAIN_AGENT:
+        return None
+    if not BRAND_LOCK_PATH_RX.search(norm):
+        return None
+    for text in _incoming_write_texts(tool, ti):
+        if STATUS_FLIP_RX.search(text):
+            return ("write", f"brand.lock validated-flip by @{agent} (Orin-only): {norm}")
+    return None
+
+
+def is_critical(tool, ti, agent):
     if re.search(r"send_email", tool, re.I):
         return ("email", "send_email")
     if tool == "Bash":
@@ -483,6 +594,16 @@ def is_critical(tool, ti):
     if tool in WRITE_TOOLS:
         path = str(ti.get("file_path", "") or ti.get("notebook_path", "") or "")
         norm = os.path.normpath(path) if path else path
+        # (a) brand.lock validated-flip: a sub-agent self-approving masters.
+        flip = _brand_lock_flip_gate(tool, ti, norm, agent)
+        if flip:
+            return flip
+        # (b) deliverable write-gate: only allowed against a validated, drift-free
+        # brand.lock (else routed to Orin). Client zones are disjoint from the
+        # ~/.claude/system critical set below, so ordering is independent.
+        gate = _deliverable_write_gate(norm)
+        if gate:
+            return gate
         # Safe-write carve-out wins over the critical-write gate: a memory-file
         # write is routine. Traversal is defeated by normpath above -- a path
         # that resolves out of .../memory/ no longer matches SAFE and falls
@@ -610,7 +731,7 @@ def main():
         # Main agent's PROJECT_DIR is the repo root (basename = "marveen"), not "orin"
         agent = MAIN_AGENT if basename == os.path.basename(PROJECT_ROOT) else basename
 
-    crit = is_critical(tool, ti)
+    crit = is_critical(tool, ti, agent)
     if not crit:
         allow()
 

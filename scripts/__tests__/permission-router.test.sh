@@ -14,7 +14,7 @@ pr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pr)
 
 def critical(cmd):
-    return pr.is_critical("Bash", {"command": cmd}) is not None
+    return pr.is_critical("Bash", {"command": cmd}, "dex") is not None
 
 FP_HEREDOC = """cd /home/karma/marveen && curl -s -X POST http://localhost:3420/api/messages \\
   -H "Content-Type: application/json" \\
@@ -64,7 +64,7 @@ cases = [
 ]
 
 def wcritical(tool, path):
-    return pr.is_critical(tool, {"file_path": path}) is not None
+    return pr.is_critical(tool, {"file_path": path}, "dex") is not None
 
 write_cases = [
     ("tp: Write ~/.claude ala", "Write", "/home/karma/.claude/hooks/evil.py", True),
