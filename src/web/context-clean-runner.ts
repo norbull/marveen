@@ -169,7 +169,7 @@ function buildWarnPrompt(
 // After a fresh restart, inject the saved structured task-state so the agent
 // resumes on its own. No-op (beyond clearing the pending flag) if the agent never
 // wrote a resume file or it carries no usable content.
-function tryInjectResume(name: string, session: string, host: string | null): void {
+async function tryInjectResume(name: string, session: string, host: string | null): Promise<void> {
   const p = resumePathFor(name)
   let rs = null
   if (p && existsSync(p)) {
@@ -177,7 +177,7 @@ function tryInjectResume(name: string, session: string, host: string | null): vo
   }
   if (rs) {
     try {
-      sendPromptToSession(session, formatResumePrompt(rs), host)
+      await sendPromptToSession(session, formatResumePrompt(rs), host)
       logger.info({ name, activeTask: rs.activeTask }, 'context-clean: auto-resume injected after restart')
     } catch (err) {
       logger.warn({ err, name }, 'context-clean: resume injection failed')
@@ -187,7 +187,7 @@ function tryInjectResume(name: string, session: string, host: string | null): vo
   pendingResume.delete(name)
 }
 
-function checkAgent(name: string, nowMs: number): void {
+async function checkAgent(name: string, nowMs: number): Promise<void> {
   const cfg = readContextCleanConfig(name, readAgentModel(name))
   if (!cfg.enabled) {
     states.delete(name)
@@ -206,7 +206,7 @@ function checkAgent(name: string, nowMs: number): void {
     const session = agentSessionName(name)
     const host = readAgentRemoteHost(name)
     if (!paneIsIdle(session, host)) return                  // wait for a settled prompt
-    tryInjectResume(name, session, host)
+    await tryInjectResume(name, session, host)
     return
   }
 
@@ -293,7 +293,10 @@ function checkAgent(name: string, nowMs: number): void {
         : 'schedule'
       if (trigger === 'schedule') lastScheduledWarn.set(name, nowMs)
       try {
-        sendPromptToSession(session, buildWarnPrompt(name, ctx, cfg, trigger, signalPath, resumePath), host)
+        // Await the warn injection BEFORE flipping state to 'warned': if the send
+        // throws, the catch leaves state idle so the next tick re-attempts (the
+        // correct ordering, preserved now that sendPromptToSession is async).
+        await sendPromptToSession(session, buildWarnPrompt(name, ctx, cfg, trigger, signalPath, resumePath), host)
         states.set(name, { phase: 'warned', warnedAtMs: nowMs, trigger })
         logger.info({ name, contextTokens: ctx, trigger }, 'context-clean: warned agent, awaiting save + signal')
       } catch (err) {
@@ -331,12 +334,14 @@ function checkAgent(name: string, nowMs: number): void {
 }
 
 export function startContextCleanRunner(): NodeJS.Timeout {
-  function sweep() {
+  async function sweep() {
     const now = Date.now()
     for (const name of listAgentNames()) {
-      try { checkAgent(name, now) } catch (err) { logger.debug({ err, agent: name }, 'context-clean: agent check error') }
+      try { await checkAgent(name, now) } catch (err) { logger.debug({ err, agent: name }, 'context-clean: agent check error') }
     }
   }
-  setTimeout(sweep, INITIAL_DELAY_MS)
-  return setInterval(sweep, INTERVAL_MS)
+  // sweep is async now (checkAgent awaits sendPromptToSession); the per-agent
+  // try/catch above means sweep never rejects, so void fire-and-forget is safe.
+  setTimeout(() => void sweep(), INITIAL_DELAY_MS)
+  return setInterval(() => void sweep(), INTERVAL_MS)
 }

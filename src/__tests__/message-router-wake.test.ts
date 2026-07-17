@@ -25,6 +25,14 @@ vi.mock('../logger.js', () => ({
 
 vi.mock('../config.js', () => ({
   MAIN_AGENT_ID: 'orin',
+  // v1.22.2: message-router now pulls in the federation subsystem, whose
+  // config.ts imports STORE_DIR from config.js. Provide it so the partial mock
+  // does not break the import graph.
+  STORE_DIR: '/tmp/mr-wake-test-store',
+  // v1.22.2: runMessageRouterTick tail-calls maybeWakeSubAgentsForTelegram,
+  // which reads this flag. Default-off (as in prod) so the sub-agent wake path
+  // early-returns and the tick's async tail does not throw an unhandled mock miss.
+  SUBAGENT_TELEGRAM_WAKE_ENABLED: false,
 }))
 
 vi.mock('../web/main-agent.js', () => ({
