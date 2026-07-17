@@ -48,9 +48,58 @@ const SECURITY_TAG_RX = new RegExp(
 // still finds every occurrence in audit logs.
 const STRIPPED_SENTINEL = `[[SECURITY_TAG_REMOVED_${randomBytes(4).toString('hex')}]]`
 
+/** Neutralize security-framing tags in free text that reaches an agent's
+ *  context OUTSIDE a wrap (e.g. peer-supplied catalog text rendered into the
+ *  routing directory). Same regex + sentinel as the wrappers -- never
+ *  duplicated at call sites. */
+export function scrubSecurityTags(raw: string): string {
+  return raw.replace(SECURITY_TAG_RX, STRIPPED_SENTINEL)
+}
+
 // Raw agent identifier: no ':' allowed (the router builds "agent:NAME" itself).
 export function sanitizeAgentIdent(raw: string): string {
   return String(raw ?? '').replace(/[^a-zA-Z0-9_-]/g, '')
+}
+
+// Capability tag injected into agent CLAUDE.md files. Accepts only lowercase
+// alphanumeric + hyphen (conservative whitelist) to prevent a malicious
+// capability string from becoming a prompt-injection vector when embedded in
+// another agent's system prompt.
+//
+// Threat model: PUT /api/agents/:name/capabilities is Bearer-token-accessible
+// and persona frontmatter is user-editable. Both are external-input paths.
+// A value like "IGNORE ALL PREVIOUS INSTRUCTIONS..." could silently flow into
+// every peer agent's CLAUDE.md during scaffold.
+//
+// We do NOT normalise (no character substitution): a tag that does not match
+// the whitelist is DROPPED entirely rather than transformed. This closes the
+// smuggling path where replace(/[^a-z0-9-]/g, '-') would turn
+// "IGNORE ALL PREVIOUS INSTRUCTIONS" into "ignore-all-previous-instructio"
+// (still 32 chars, still matches /^[a-z0-9][a-z0-9-]{0,31}$/).
+// Only trim() + toLowerCase() are allowed because they do not change which
+// character class a byte belongs to.
+const CAPABILITY_TAG_RE = /^[a-z0-9][a-z0-9-]{0,31}$/
+export const CAPABILITY_TAG_MAX_PER_AGENT = 12
+
+export function sanitizeCapabilityTag(raw: string): string | null {
+  const t = String(raw ?? '').toLowerCase().trim()
+  return CAPABILITY_TAG_RE.test(t) ? t : null
+}
+
+// Self-declared origin_note label injected into a message's delivery PREFIX
+// (outside the <untrusted> wrapper), e.g. `self-tagged origin:"worker-fast"`.
+// Because it lands in the trusted framing text, a raw value containing quotes,
+// brackets, angle brackets, colons or newlines could break out and forge a
+// `[Uzenet @owner-tol -- trusted team member]:` line -> cross-agent prompt
+// injection. Whitelist to a safe label charset (word chars, space, and a few
+// separators), collapse whitespace, cap length; empty result -> null (no tag).
+export function sanitizeOriginNote(raw: string | null | undefined): string | null {
+  const cleaned = String(raw ?? '')
+    .replace(/[^a-zA-Z0-9 _.\-/]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60)
+  return cleaned.length > 0 ? cleaned : null
 }
 
 // Assembled source attribute: accepts "prefix:name" (e.g. "agent:dev3",
@@ -68,6 +117,34 @@ export function wrapUntrusted(source: string, content: string | null | undefined
   const scrubbed = text.replace(SECURITY_TAG_RX, STRIPPED_SENTINEL)
   const safeSource = sanitizeAgentSource(source)
   return `<untrusted source="${safeSource}">\n${scrubbed}\n</untrusted>`
+}
+
+// Generate a per-fetch nonce for datamarking web-fetched content. The nonce is
+// included in the <untrusted> tag so that if an injection attempt exfiltrates
+// content (e.g. by appending it to a URL), the nonce in the exfiltrated data
+// traces back to the specific fetch that was the injection vector. The nonce is
+// NOT a secret: its value is visible in the prompt. Its purpose is attribution.
+export function generateFetchNonce(): string {
+  return randomBytes(6).toString('hex')
+}
+
+// Wrap web-fetched content with a per-fetch nonce embedded in the tag. Use
+// this instead of wrapUntrusted for any content obtained via WebFetch or the
+// quarantine sub-agent. The nonce appears in prompt context; if the fetched
+// content triggers an exfiltration tool call, the tool input will carry the
+// nonce, pointing to the exact fetch that delivered the injected payload.
+export function wrapUntrustedFetch(
+  url: string,
+  content: string | null | undefined,
+  nonce: string,
+): string {
+  if (content == null) return ''
+  const text = String(content)
+  if (text.length === 0) return ''
+  const scrubbed = text.replace(SECURITY_TAG_RX, STRIPPED_SENTINEL)
+  // Strip chars that could break out of an XML attribute; nonce is already hex.
+  const safeUrl = url.replace(/[^a-zA-Z0-9.:/_?&=%-]/g, '').slice(0, 256)
+  return `<untrusted source="web-fetch:${safeUrl}" fetch-nonce="${nonce}">\n${scrubbed}\n</untrusted>`
 }
 
 export function wrapTrustedPeer(source: string, content: string | null | undefined): string {

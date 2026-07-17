@@ -31,13 +31,43 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)/hooks"
 DEST_DIR="$HOME/.claude/hooks"
 SETTINGS="$HOME/.claude/settings.json"
 
+# The watchdog unit/label name keys off SERVICE_ID, matching install-linux.sh's
+# ${SERVICE_ID}-dashboard/-channels units and the macOS com.${SERVICE_ID}.*
+# launchd labels. Derive it from the install .env so a renamed install
+# (BOT_NAME != Marveen) does NOT get an orphaned marveen-* unit left behind.
+INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Read a single key from a .env file without sourcing it.
+# Sourcing executes the file: an unquoted value with spaces (e.g. OWNER_NAME=Foo Bar)
+# causes bash to run the trailing word as a command; a $(...) value runs arbitrary code.
+# This function uses grep + pure string manipulation -- no eval, no subshell execution.
+read_env() {
+  [ -f "$INSTALL_DIR/.env" ] || return 0
+  local v
+  v="$(grep -E "^${1}=" "$INSTALL_DIR/.env" | tail -1)" || return 0
+  v="${v#*=}"
+  case "$v" in
+    '"'*) v="${v#\"}"; v="${v%\"}" ;;
+    "'"*) v="${v#\'}"; v="${v%\'}" ;;
+  esac
+  printf '%s' "$v"
+}
+SERVICE_ID="$(read_env SERVICE_ID)"
+MAIN_AGENT_ID_ENV="$(read_env MAIN_AGENT_ID)"
+BOT_NAME="$(read_env BOT_NAME)"
+SERVICE_ID="${SERVICE_ID:-${MAIN_AGENT_ID_ENV:-marveen}}"
+BOT_NAME="${BOT_NAME:-Marveen}"
+
 SUBMIT_HOOK="$DEST_DIR/telegram_progress.py"
 STOP_HOOK="$DEST_DIR/telegram_progress_clear.py"
 REPLY_HOOK="$DEST_DIR/telegram_progress_reply_clear.py"
 WATCHDOG="$DEST_DIR/telegram_progress_watchdog.py"
+# Agent-invoked CLI (not a settings.json hook): the Bot API fallback sender that
+# clears the placeholder on manual delivery so the Stop hook never re-sends.
+FALLBACK_SEND="$DEST_DIR/telegram_fallback_send.py"
 
 for f in telegram_progress.py telegram_progress_clear.py \
-         telegram_progress_reply_clear.py telegram_progress_watchdog.py; do
+         telegram_progress_reply_clear.py telegram_progress_watchdog.py \
+         telegram_fallback_send.py; do
   if [ ! -f "$SRC_DIR/$f" ]; then
     echo "❌ Source hook not found: $SRC_DIR/$f" >&2
     exit 1
@@ -49,7 +79,8 @@ cp "$SRC_DIR/telegram_progress.py"             "$SUBMIT_HOOK"
 cp "$SRC_DIR/telegram_progress_clear.py"       "$STOP_HOOK"
 cp "$SRC_DIR/telegram_progress_reply_clear.py" "$REPLY_HOOK"
 cp "$SRC_DIR/telegram_progress_watchdog.py"    "$WATCHDOG"
-chmod +x "$SUBMIT_HOOK" "$STOP_HOOK" "$REPLY_HOOK" "$WATCHDOG"
+cp "$SRC_DIR/telegram_fallback_send.py"        "$FALLBACK_SEND"
+chmod +x "$SUBMIT_HOOK" "$STOP_HOOK" "$REPLY_HOOK" "$WATCHDOG" "$FALLBACK_SEND"
 echo "✓ Hooks installed in $DEST_DIR"
 
 if [ ! -f "$SETTINGS" ]; then
@@ -137,7 +168,7 @@ PYEOF
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
   PLIST_DIR="$HOME/Library/LaunchAgents"
-  LABEL="com.marveen.telegram-progress-watchdog"
+  LABEL="com.${SERVICE_ID}.telegram-progress-watchdog"
   PLIST="$PLIST_DIR/$LABEL.plist"
   LOG="$HOME/.claude/channels/telegram-progress-watchdog.log"
   mkdir -p "$PLIST_DIR" "$HOME/.claude/channels"
@@ -176,11 +207,11 @@ PLISTEOF
 else
   # Linux: systemd user service + timer
   UNIT_DIR="$HOME/.config/systemd/user"
-  SVC="marveen-telegram-progress-watchdog"
+  SVC="${SERVICE_ID}-telegram-progress-watchdog"
   mkdir -p "$UNIT_DIR"
   cat > "$UNIT_DIR/$SVC.service" <<UNITEOF
 [Unit]
-Description=Marveen Telegram progress-indicator watchdog (sentry)
+Description=${BOT_NAME} Telegram progress-indicator watchdog (sentry)
 
 [Service]
 Type=oneshot
