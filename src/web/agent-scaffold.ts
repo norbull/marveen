@@ -139,6 +139,81 @@ export function mergeHookBlocks(
   return changed
 }
 
+// The permission-router is a PreToolUse '*' gate that consumes each grant
+// single-use (store/approvals/<agent>.granted.json -> pop). It must run EXACTLY
+// ONCE per tool call. The main agent's settings ARE the user-global
+// ~/.claude/settings.json; every sub-agent process ALSO loads that same
+// user-global file (Claude Code layers user settings over the cwd's project
+// settings). So a '*' router in a sub-agent's agent-local settings.json runs a
+// SECOND time on top of the inherited user-global one -- the first run consumes
+// the grant, the second sees an emptied store and denies -> permanent
+// grant-loop (the recurring dupla-router incident). Canonical rule: the router
+// lives ONLY in user-global; sub-agent agent-local settings must not carry it.
+export const PERMISSION_ROUTER_SCRIPT = 'permission-router.py'
+
+// True if any PreToolUse hook in the block registers the permission-router
+// (path-independent, matched by script basename).
+export function hooksBlockHasPermissionRouter(hooks: unknown): boolean {
+  if (!hooks || typeof hooks !== 'object') return false
+  const pre = (hooks as Record<string, unknown>).PreToolUse
+  if (!Array.isArray(pre)) return false
+  return (pre as HookEntry[]).some((e) =>
+    (e?.hooks ?? []).some(
+      (h) => h?.command != null && hookScriptBasename(h.command) === PERMISSION_ROUTER_SCRIPT,
+    ),
+  )
+}
+
+// Remove every PreToolUse hook whose script is the permission-router, dropping
+// any group left empty. Mutates the hooks block in place; returns true if it
+// changed anything. Keeps the router out of sub-agent agent-local settings
+// (see PERMISSION_ROUTER_SCRIPT note). Idempotent: a second call is a no-op.
+export function stripPermissionRouterHooks(hooks: Record<string, unknown>): boolean {
+  const pre = hooks.PreToolUse
+  if (!Array.isArray(pre)) return false
+  let changed = false
+  const keptGroups: HookEntry[] = []
+  for (const group of pre as HookEntry[]) {
+    if (!group || !Array.isArray(group.hooks)) {
+      keptGroups.push(group)
+      continue
+    }
+    const keptHooks = group.hooks.filter((h) => {
+      const isRouter =
+        h?.command != null && hookScriptBasename(h.command) === PERMISSION_ROUTER_SCRIPT
+      if (isRouter) changed = true
+      return !isRouter
+    })
+    if (keptHooks.length === group.hooks.length) {
+      keptGroups.push(group)
+    } else if (keptHooks.length > 0) {
+      keptGroups.push({ ...group, hooks: keptHooks })
+    }
+    // else: the group was emptied by the strip -> drop it entirely
+  }
+  if (changed) hooks.PreToolUse = keptGroups
+  return changed
+}
+
+// Safety guard for the strip: does the shared user-global settings.json
+// currently register the permission-router? A sub-agent's agent-local copy is
+// only safe to remove when the inherited user-global one actually covers it --
+// otherwise stripping would leave the sub-agent UNGATED (worse than a grant-
+// loop). Read fresh each call; a missing/unparseable file -> false (keep the
+// local router). During startup the main agent is processed first (see
+// web.ts backfill loop), so user-global is populated before any sub-agent is
+// stripped.
+export function userGlobalHasPermissionRouter(): boolean {
+  const p = join(homedir(), '.claude', 'settings.json')
+  if (!existsSync(p)) return false
+  try {
+    const s = JSON.parse(readFileSync(p, 'utf-8')) as Record<string, unknown>
+    return hooksBlockHasPermissionRouter(s.hooks)
+  } catch {
+    return false
+  }
+}
+
 // Return the settings.json path for an agent.
 // The main agent's settings live at ~/.claude/settings.json (not inside agents/).
 // Exported so the startup self-heal (hook-registration-guard) can prune stale
@@ -244,6 +319,14 @@ export function ensureAgentHooks(name: string): boolean {
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const tplHooks = tpl.hooks as Record<string, unknown>
+  // Sub-agents inherit the '*' permission-router from user-global; registering
+  // it again agent-locally double-runs the single-use grant consume -> grant-
+  // loop (dupla-router root cause). Strip it from the template BEFORE merge so
+  // it is never (re)added here, and prune any copy an earlier seed already left
+  // behind. Guarded on userGlobalHasPermissionRouter() so a sub-agent is never
+  // left ungated if the shared file somehow lacks the router.
+  const stripRouter = name !== MAIN_AGENT_ID && userGlobalHasPermissionRouter()
+  if (stripRouter) stripPermissionRouterHooks(tplHooks)
   if (existing.hooks) {
     // Merge strategy (upstream upgrade-pass + our path-independent dupla-router guard):
     //   0. Upgrade pass: in-place replace any legacy bare hook command with the
@@ -306,6 +389,12 @@ export function ensureAgentHooks(name: string): boolean {
         }
       }
     }
+    // Cross-file strip: prune any inherited '*' permission-router copy still
+    // present in the agent-local hooks. Complements the basename intra-file
+    // dedup above -- that stops a re-add during the merge; this removes a
+    // duplicate an earlier seed already wrote. Guarded on stripRouter so a
+    // sub-agent is never left ungated. (#52 dupla-router cross-file fix.)
+    if (stripRouter && stripPermissionRouterHooks(existingHooks)) changed = true
     if (!changed) return false
   } else {
     // No hooks yet: seed from template, filtering unsafe commands before writing.
@@ -404,6 +493,18 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
   if (agentGetsEmailGate(name)) injectEmailSendGate(existing)
   if (agentGetsGovernanceGates(name)) injectSelfPaceGate(existing)
   injectEgressGate(existing)
+  // A sub-agent's '*' permission-router is inherited from user-global; a copy
+  // preserved in this agent-local file from an earlier seed would double-run
+  // the single-use grant consume -> grant-loop. Prune it on every respawn
+  // (guarded so we never leave the agent ungated). (dupla-router root fix.)
+  if (
+    name !== MAIN_AGENT_ID &&
+    userGlobalHasPermissionRouter() &&
+    existing.hooks &&
+    typeof existing.hooks === 'object'
+  ) {
+    stripPermissionRouterHooks(existing.hooks as Record<string, unknown>)
+  }
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
 }
 
@@ -649,7 +750,23 @@ export function scaffoldAgentDir(name: string) {
     const tplPath = join(PROJECT_ROOT, 'templates', 'settings.json.template')
     if (existsSync(tplPath)) {
       const resolved = resolveTemplatePlaceholders(readFileSync(tplPath, 'utf-8'))
-      atomicWriteFileSync(settingsJson, resolved)
+      // Strip the '*' permission-router from the seeded copy: a sub-agent
+      // inherits it from user-global, so a local copy double-registers it and
+      // loops every grant (dupla-router fix). Guarded so we never seed a
+      // sub-agent ungated; the main agent (not scaffolded here) keeps it.
+      if (name !== MAIN_AGENT_ID && userGlobalHasPermissionRouter()) {
+        try {
+          const obj = JSON.parse(resolved) as Record<string, unknown>
+          if (obj.hooks && typeof obj.hooks === 'object') {
+            stripPermissionRouterHooks(obj.hooks as Record<string, unknown>)
+          }
+          atomicWriteFileSync(settingsJson, JSON.stringify(obj, null, 2))
+        } catch {
+          atomicWriteFileSync(settingsJson, resolved)
+        }
+      } else {
+        atomicWriteFileSync(settingsJson, resolved)
+      }
     }
   }
 }
