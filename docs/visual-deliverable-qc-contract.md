@@ -1,6 +1,6 @@
 # Visual Deliverable QC-Gate Contract
 
-**Verzió:** 1.0  
+**Verzió:** 1.5  
 **Dátum:** 2026-07-18  
 **Szerző:** nova (kockázatelemzés) + orin (koordináció)  
 **Hivatkozások:** `docs/client-deliverable-governance.md`, `store/governance-inputs/model-routing.json`, `src/costops/circuit-breaker.ts`
@@ -32,6 +32,7 @@ Ezek az Iris QC-rubrika v1.0 canonical fail_code-jai, a `src/costops/circuit-bre
 | `PROHIBITED_ELEMENT` | A brand.lock.json `qc.prohibited_elements` listáján szereplő elem |
 | `LOW_RESOLUTION` | Felbontás a platform minimum alatt (ld. Gate 2) |
 | `UNSUPPORTED_FORMAT` | Fájlformátum nem megfelelő a leszállítási csatornának |
+| `HAND_ANATOMY_DEFECT` | Emberi kézen látható AI-generálási defekt: összeolvadt/hiányzó/extra ujj, warp, ujjszám != 5 ahol számlálható, tiszta szeparáció hiánya - KIEMELTEN mozgó/gesztikuláló és terméket-tartó kezeken. **HÁROM KÖTELEZŐ KAPU (compose-then-animate pipeline-ban):** (1) hero-still automata ujjszámlálás - animáció ELŐTT, olcsó, döntő (Dex/Nova); (2) human hero-approval - Orin saját explicit verdiktje (indoklással) + Norbi ellenőrzi kép+verdikt + Norbi GO, animáció ELŐTT, kalibrációs tanuló-hurok; (3) anim frame-by-frame - Gate 4-ban, mintavétel TILTOTT (Nova). (1) kihagyása ~$0.60 pazarlás; (2) kihagyása szubjektív minőségi kockázat. (Tanulság: 2026-07-18 LUME demo - flux_edit 6-ujjas hero-stillt generált; (1)+(2) kapuk hiánya okozta a Gate 4 P0 misst.) |
 
 **P0 szabály:** egyetlen P0 jelenlétében a deliverable FAIL, a pontszám irreleváns. A P0-t a retry ciklusban mindig meg kell szüntetni.
 
@@ -125,7 +126,17 @@ Ezek az Iris QC-rubrika v1.0 canonical fail_code-jai, a `src/costops/circuit-bre
 - **Termékforma és részletek**: logó, varrat, szín, anyagminőség, termékfeliratok egyeznek a master view-val
 - **Logo elhelyezés és méret**: clear space szabály, variáns megfelelő a kontextushoz (primary/mono)
 - **Színek**: szubjektív vizuális egyezés a branddel, deltaE-n túl a "feel" is számít
-- **Anatómia és fizika**: emberalak esetén kézujjak, végtagok, perspektíva; objektum esetén gravitáció, anyagtulajdonságok
+- **Anatómia és fizika (P0-szintű kéz-check kötelező)**: emberalak esetén MINDEN látható emberi kéz vizsgálata kötelező: ujjszám=5 ahol számlálható, tiszta ujj-szeparáció, nincs összeolvadás/warp/extra vagy hiányzó ujj, természetes ízületek - KIEMELTEN mozgó/gesztikuláló kezeken és terméket-tartó kezeken; végtagok, perspektíva; objektum esetén gravitáció, anyagtulajdonságok.
+
+  **VIDEÓNÁL HÁROM KÖTELEZŐ KÉZELLENŐRZÉSI KAPU (sorrendben, animáció előtt és után):**
+
+  **(1) Hero-still rigorous ujjszámlálás -- ELSŐ, OLCSÓ, DÖNTŐ** (animáció ELŐTT, Gate 3-ban vagy közvetlenül utána): ugyanolyan szigorral mint az OCR-cimke-check. Ujjszám=5 minden számlálható kézen, nincs összeolvadt/extra/elnyúlt ujj, tiszta szeparáció. Ha FAIL -> új hero generálás (~$0.10), animáció NEM indul. Hibás heróra animációt indítani ~$0.60 felesleges pazarlás. A generátor (flux_edit, gpt-image) maga is produkálhat 6-ujjas hero-stillt -- ez a kapu fogja el, nem az anim-check. Aktor: Dex/Nova.
+
+  **(2) Human hero-approval -- KÖTELEZŐ HUMAN-IN-THE-LOOP kalibrációs hurokkal** (animáció ELŐTT, (1) PASS után): Orin a hero-stillt SAJÁT EXPLICIT VERDIKTJÉVEL együtt küldi Norbinak - nem csak továbbítja, hanem konkrét indoklással nyilatkozik ("átengedném / nem, mert...": ujjszám, cimke-helyesség, termék-pontosság, kompozíció). Norbi MINDKETTŐT ellenőrzi: a képet ÉS Orin ítéletét. Animáció kizárólag Norbi explicit GO-jára indul. Cél: kalibrációs tanuló-hurok - Norbi látja Orin döntőképességét, Orin tanulja Norbi sztenderdját a korrekciókból; idővel Orin ítélete megbízhatóbbá válik, Norbi lazíthat a kézi ellenőrzésen. A végső GO mindig Norbié. Aktor: Orin (saját verdikt + koordináció) -> Norbi (ellenőrzés + GO).
+
+  **(3) Anim frame-by-frame check -- harmadlagos** (Gate 4-ban, animáció UTÁN): mintavételes (start/mid/end) check TILTOTT. Talking-avatar/gesztikuláló klipeknél az animáció kockáról-kockára változik; egyetlen defektes kocka is P0 diszkvalifikáció. Minimális keret-szám: ~5-8 egyenletesen elosztott kocka + MINDEN kocka ahol a kéz fókuszban van és ujjak számlálhatók. Szükséges még ha (1)+(2) PASS volt, mert az animáció tiszta hero-stilltől is generálhat új defektet. Aktor: Nova.
+
+  (Tanulság: 2026-07-18 LUME demo c3c - a flux_edit 6-ujjas hero-stillt generált, az anim hűen vitte tovább; (1) és (2) kapuk hiánya okozta a P0 misst Gate 4-nél.)
 - **Szöveg és ékezetek**: OCR-en felül vizuálisan is olvasható, kerning/spacing elfogadható
 - **Frame-to-frame drift** (video): azonos jelenet felvételei között nincs identitás- vagy szín-ugrás, cut-on-action konzisztens
 - **Tiltott elemek**: brand.lock `prohibited_elements` lista alapján vizuális check
