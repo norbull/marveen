@@ -142,5 +142,80 @@ describe('costops API (route smoke)', () => {
       await tryHandleCosts(ctx)
       expect(out.status).toBe(400)
     })
+
+    it('rejects an omitted billed_cost with 400 when no price is configured', async () => {
+      // default (no config file) -> empty pricing table -> cannot estimate
+      const { ctx, out } = fakeCtx('/api/costs/usage', 'POST', JSON.stringify({ provider: 'fal.ai', service_name: 'fal-ai/flux-pro/kontext' }))
+      await tryHandleCosts(ctx)
+      expect(out.status).toBe(400)
+      expect(String(out.body.error)).toContain('no price configured')
+    })
+  })
+
+  // Estimate mode + budget gate need a real config with a pricing table.
+  describe('priced config (estimate + budget-check)', () => {
+    const hadConfig = existsSync(COSTOPS_CONFIG_PATH)
+    beforeEach(() => {
+      mkdirSync(dirname(COSTOPS_CONFIG_PATH), { recursive: true })
+      writeFileSync(COSTOPS_CONFIG_PATH, JSON.stringify({
+        version: 1, currency: 'HUF', fixed_costs: [], budgets: [],
+        circuit_breaker: { currency: 'USD', daily_cap: 5, project_cap: 20, max_retries: 2, systematic_threshold: 2 },
+        pricing: [
+          { provider: 'fal.ai', model: 'fal-ai/flux-pro/kontext', unit_price: 0.04, unit: 'image', currency: 'USD' },
+        ],
+      }))
+    })
+    afterEach(() => { if (!hadConfig) { try { unlinkSync(COSTOPS_CONFIG_PATH) } catch { /* already gone */ } } })
+
+    it('POST /api/costs/usage derives billed_cost from the price table when omitted', async () => {
+      const { ctx, out } = fakeCtx('/api/costs/usage', 'POST', JSON.stringify({
+        provider: 'fal.ai', service_name: 'fal-ai/flux-pro/kontext', consumed_quantity: 3, agent: 'iris', project: 'zoe', ref: 'gen-est-1',
+      }))
+      expect(await tryHandleCosts(ctx)).toBe(true)
+      expect(out.status).toBe(200)
+      expect(out.body.estimated).toBe(true)
+      expect(out.body.billed_cost).toBeCloseTo(0.12)   // 0.04 * 3
+      const row = getDb().prepare("SELECT billed_cost, confidence, currency FROM cost_line_items WHERE dedup_key='usage|fal.ai|gen-est-1'").get() as any
+      expect(row.billed_cost).toBeCloseTo(0.12)
+      expect(row.confidence).toBe('estimate')
+      expect(row.currency).toBe('USD')
+    })
+
+    it('an explicit billed_cost still takes precedence over the price table', async () => {
+      const { ctx, out } = fakeCtx('/api/costs/usage', 'POST', JSON.stringify({
+        provider: 'fal.ai', service_name: 'fal-ai/flux-pro/kontext', billed_cost: 9.99, ref: 'gen-explicit',
+      }))
+      await tryHandleCosts(ctx)
+      expect(out.body.estimated).toBe(false)
+      expect(out.body.billed_cost).toBe(9.99)
+    })
+
+    it('GET /api/costs/budget-check returns allow with no spend yet', async () => {
+      const { ctx, out } = fakeCtx('/api/costs/budget-check?project=zoe')
+      expect(await tryHandleCosts(ctx)).toBe(true)
+      expect(out.status).toBe(200)
+      expect(out.body.action).toBe('allow')
+      expect(out.body.daily_spend).toBe(0)
+      expect(out.body.currency).toBe('USD')
+    })
+
+    it('GET /api/costs/budget-check pre-flight estimates a pending charge', async () => {
+      const { ctx, out } = fakeCtx('/api/costs/budget-check?project=zoe&provider=fal.ai&model=fal-ai/flux-pro/kontext&quantity=2')
+      await tryHandleCosts(ctx)
+      expect(out.body.preflight.estimated_cost).toBeCloseTo(0.08)  // 0.04 * 2
+      expect(out.body.preflight.would_exceed_daily).toBe(false)
+    })
+
+    it('GET /api/costs/budget-check hard_holds once the daily cap is reached', async () => {
+      // record a USD usage charge that meets the daily_cap (5) for today
+      const post = fakeCtx('/api/costs/usage', 'POST', JSON.stringify({
+        provider: 'fal.ai', currency: 'USD', billed_cost: 5, ref: 'gen-cap',
+      }))
+      await tryHandleCosts(post.ctx)
+      const { ctx, out } = fakeCtx('/api/costs/budget-check')
+      await tryHandleCosts(ctx)
+      expect(out.body.action).toBe('hard_hold')
+      expect(String(out.body.reason)).toContain('daily cap reached')
+    })
   })
 })
