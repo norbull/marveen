@@ -13,6 +13,7 @@ import {
 } from './config.js'
 import { getHeartbeatKanbanSummary, getActiveScheduledTaskCount } from './db.js'
 import { getCalendarEvents, type CalendarEvent } from './google-api.js'
+import { listMessages, type GmailSummary } from './gmail-api.js'
 import { runAgent } from './agent.js'
 import { notifyTelegram } from './notify.js'
 import { logger } from './logger.js'
@@ -294,6 +295,7 @@ interface SystemInfo {
 interface HeartbeatData {
   timestamp: Date
   calendar: CalendarEvent[]
+  emails: GmailSummary[]
   kanban: { urgent: number; in_progress: number; waiting: number; urgentTitles: string[]; waitingTitles: string[] }
   system: SystemInfo
   tasks: { count: number; nextRun: number | null }
@@ -308,6 +310,19 @@ async function collectCalendar(): Promise<CalendarEvent[]> {
     return await getCalendarEvents(HEARTBEAT_CALENDAR_ID, now, twoHoursLater)
   } catch (err) {
     logger.error({ err }, 'Heartbeat: calendar fetch failed')
+    return []
+  }
+}
+
+async function collectEmails(): Promise<GmailSummary[]> {
+  // Unread mail from the last 2 hours. Direct Gmail helper (google-auth.ts
+  // refresh-token flow) -- replaces the old `search_emails` MCP tool, which
+  // never loaded headless. Graceful: before the OAuth token exists (or on any
+  // API hiccup) this returns [] and the heartbeat runs without the mail block.
+  try {
+    return await listMessages('is:unread newer_than:2h', 10)
+  } catch (err) {
+    logger.error({ err }, 'Heartbeat: email fetch failed')
     return []
   }
 }
@@ -339,13 +354,14 @@ function collectSystem(): SystemInfo {
 }
 
 async function collectData(): Promise<HeartbeatData> {
-  const [calendar, kanban, system] = await Promise.all([
+  const [calendar, emails, kanban, system] = await Promise.all([
     collectCalendar(),
+    collectEmails(),
     Promise.resolve(collectKanban()),
     Promise.resolve(collectSystem()),
   ])
   const tasks = getActiveScheduledTaskCount()
-  return { timestamp: new Date(), calendar, kanban, system, tasks }
+  return { timestamp: new Date(), calendar, emails, kanban, system, tasks }
 }
 
 // --- Notification filter ---
@@ -386,8 +402,7 @@ function buildAgentPrompt(data: HeartbeatData): string {
   // attacker-controlled strings (calendar/kanban/email titles) appear.
   let prompt = UNTRUSTED_PREAMBLE + '\n'
   prompt += `Heartbeat ellenorzes -- ${timeStr}\n\n`
-  prompt += `Az alabbi adatokat gyujtottem nativ modon (API/DB). Fogalmazz tomor, emberi osszefoglalot ${OWNER_NAME} szamara.\n`
-  prompt += `FONTOS: Nezd meg az emaileket is MCP-n keresztul (search_emails, utolso 2 ora, olvasatlanok).\n`
+  prompt += `Az alabbi adatokat gyujtottem nativ modon (API/DB), az emaileket is (Gmail API). Fogalmazz tomor, emberi osszefoglalot ${OWNER_NAME} szamara.\n`
   prompt += `Hasznald a HEARTBEAT.md formatumot.\n\n`
 
   // Calendar -- event summaries and attendee names come from whoever sent the
@@ -404,6 +419,21 @@ function buildAgentPrompt(data: HeartbeatData): string {
       const summaryWrapped = wrapUntrusted('gcal-event-summary', ev.summary ?? '(cim nelkul)')
       const attendeesWrapped = wrapUntrusted('gcal-event-attendees', attendeesRaw)
       prompt += `- @ ${start}\n  summary: ${summaryWrapped}\n  attendees: ${attendeesWrapped}\n`
+    }
+    prompt += '\n'
+  }
+
+  // Email -- from/subject/snippet are written by whoever sent the mail, so each
+  // field is wrapped individually as untrusted data (prompt-injection guard).
+  prompt += `## Email (olvasatlan, utolso 2 ora)\n`
+  if (data.emails.length === 0) {
+    prompt += `Nincs olvasatlan email.\n\n`
+  } else {
+    for (const m of data.emails) {
+      const fromW = wrapUntrusted('gmail-from', m.from || '(ismeretlen)')
+      const subjW = wrapUntrusted('gmail-subject', m.subject || '(nincs targy)')
+      const snipW = wrapUntrusted('gmail-snippet', m.snippet || '')
+      prompt += `- from: ${fromW}\n  subject: ${subjW}\n  snippet: ${snipW}\n`
     }
     prompt += '\n'
   }
