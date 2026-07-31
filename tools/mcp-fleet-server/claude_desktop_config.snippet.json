@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "marveen-fleet": {
+      "command": "wsl.exe",
+      "args": [
+        "bash",
+        "-lc",
+        "exec /home/karma/marveen/node_modules/.bin/tsx /home/karma/marveen/tools/mcp-fleet-server/index.ts"
+      ]
+    }
+  }
+}
