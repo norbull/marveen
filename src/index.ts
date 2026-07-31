@@ -18,11 +18,15 @@ import { ensureHeartbeatAgent, shouldBootHeartbeatAgent, HEARTBEAT_AGENT_NAME } 
 import { startAgentProcess } from './web/agent-process.js'
 import { renameSharedCredentialsIfSafe, fleetTokenBootPass } from './web/claude-credentials-guard.js'
 import { startWebServer } from './web.js'
+import { startChannelOutboxDrain, stopChannelOutboxDrain } from './channel-outbox.js'
 import { logger } from './logger.js'
 import { startInviteMonitor, stopInviteMonitor } from './web/channel-invites.js'
 import { ensureDiscordChannelGroup } from './web/discord-group-bootstrap.js'
 import { startChannelRequestWatcher, stopChannelRequestWatcher } from './web/channel-request-watcher.js'
 import { startStoreWatcher, stopStoreWatcher } from './store-watcher.js'
+import { startAutoRecovery, stopAutoRecovery } from './web/auto-recovery.js'
+import { startKanbanProjectsSync, stopKanbanProjectsSync } from './kanban-projects-sync.js'
+import { buildKanbanProjectsClient } from './kanban-projects-client.js'
 import { AGENTS_BASE_DIR } from './web/agent-config.js'
 import {
   acquirePortLock,
@@ -384,6 +388,9 @@ const shutdown = (): void => {
     try { stopInviteMonitor() } catch (err) { logger.warn({ err }, 'stopInviteMonitor threw during shutdown') }
     try { stopChannelRequestWatcher() } catch (err) { logger.warn({ err }, 'stopChannelRequestWatcher threw during shutdown') }
     try { stopStoreWatcher() } catch (err) { logger.warn({ err }, 'stopStoreWatcher threw during shutdown') }
+    try { stopAutoRecovery() } catch (err) { logger.warn({ err }, 'stopAutoRecovery threw during shutdown') }
+    try { stopKanbanProjectsSync() } catch (err) { logger.warn({ err }, 'stopKanbanProjectsSync threw during shutdown') }
+    try { stopChannelOutboxDrain() } catch (err) { logger.warn({ err }, 'stopChannelOutboxDrain threw during shutdown') }
     if (decayInterval) clearInterval(decayInterval)
     if (digestTimer) clearTimeout(digestTimer)
     if (digestInterval) clearInterval(digestInterval)
@@ -450,6 +457,9 @@ async function main(): Promise<void> {
   runDecaySweep()
   decayInterval = setInterval(runDecaySweep, 24 * 60 * 60 * 1000)
   logger.info('Memoria leepulesi ciklus beallitva (24 oras)')
+
+  // Channel outbox drain: flush DEAD-time queued replies once plugins recover.
+  startChannelOutboxDrain()
 
   // Daily digest at 23:00. Timer handles kept so shutdown can drop them.
   function scheduleDailyDigest() {
@@ -541,6 +551,17 @@ async function main(): Promise<void> {
 
   // Web dashboard
   webServer = startWebServer(WEB_PORT)
+
+  // Auto-recovery orchestrator (#fdfa238a). Dry-run by default; needs the web
+  // server + channel sessions up first so its probes have something to observe.
+  startAutoRecovery()
+
+  // Kanban <-> GitHub Projects v2 sync. Feature-flagged: no-op unless both the
+  // project-scope token and the project id are configured in store/. Built async
+  // (discovers the project schema once) without blocking the rest of boot.
+  buildKanbanProjectsClient()
+    .then((client) => startKanbanProjectsSync({ client }))
+    .catch((err) => logger.warn({ err }, 'kanban-sync: client boot failed -- sync not started'))
 
   logger.info(`Marveen fut! Dashboard: http://localhost:${WEB_PORT}`)
   logger.info('Telegram kommunikacio: Claude Code Channels kezeli')

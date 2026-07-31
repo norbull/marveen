@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Marveen ops-hook self-heal at boot and every 5 minutes
+
+[Timer]
+# Boot-time check (after the dashboard settles) + periodic sweep.
+OnBootSec=120s
+OnUnitActiveSec=5min
+AccuracySec=20s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

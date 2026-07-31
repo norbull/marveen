@@ -25,6 +25,7 @@ import {
 import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
+import { maybeWakeSubAgentsForTelegram } from './telegram-inbox-wake.js'
 
 // A message that cannot be delivered within this window (target session never
 // exists / stays busy) is marked failed so it stops clogging the pending
@@ -86,12 +87,78 @@ function notifyOrchestratorOfFailedHandoff(msg: AgentMessage, reason: string): v
     logger.warn({ err, id: msg.id }, 'Failed to enqueue handoff-failure notification')
   }
 }
-// Wakeup cooldown for the main agent: the router fires at most one
-// sendPromptToSession wakeup per COOLDOWN_MS window to avoid spamming the
-// channels session. 45s gives enough headroom that a normal turn (typically
-// 5-30s) ends and drain-inbox fires before we would retry.
-let lastMainAgentWakeupMs = 0
-const MAIN_AGENT_WAKEUP_COOLDOWN_MS = 45 * 1000
+// How long a main-agent message must wait before the first wake-nudge. Gives a
+// naturally-arriving user prompt / heartbeat a chance to drain it first, so an
+// idle channel is not nudged for a reply the main agent was about to pick up.
+const MAIN_WAKE_MIN_AGE_MS = 30 * 1000
+// Minimum gap between wake-nudges. One nudge starts a turn whose drain claims
+// the WHOLE backlog, so re-nudging sooner would pile redundant prompts on a
+// session that is already handling the inbox. Bounds it to at most one nudge
+// per window even if the turn is slow to start.
+const MAIN_WAKE_DEBOUNCE_MS = 60 * 1000
+// The content-free wake prompt. The inbox-drain UserPromptSubmit hook PREPENDS
+// the claimed (already security-wrapped) messages above this line, so the nudge
+// text is only a trailing trigger -- it must never carry inter-agent content
+// itself (that is the race this design avoids).
+const MAIN_WAKE_NUDGE =
+  '[orin-wake] Bejövő inter-agent üzenet(ek) várnak a soron; a drain hook behúzta őket a kontextusba fentebb. Dolgozd fel és válaszolj.'
+// When the last wake-nudge was sent (module-scoped, mirrors routerLoggedMisses).
+let _lastMainWakeAt = 0
+
+/**
+ * Pure decision: should the router send a wake-nudge to the main agent's
+ * channel session? Dependency-free so it is unit-testable without tmux, like
+ * shouldAbandon. ALL conditions must hold:
+ *   - the channel session exists (nothing to wake otherwise);
+ *   - it is idle (never inject a prompt mid-turn -- that is the race);
+ *   - the oldest pending main-agent message is older than minAgeMs (let the
+ *     natural pull drain a fresh one first);
+ *   - the debounce window since the last nudge has elapsed (one nudge per
+ *     backlog, not one per tick).
+ */
+export function shouldWakeMainAgent(params: {
+  oldestPendingAgeMs: number
+  now: number
+  lastWakeAt: number
+  sessionExists: boolean
+  sessionIdle: boolean
+  minAgeMs: number
+  debounceMs: number
+}): boolean {
+  const { oldestPendingAgeMs, now, lastWakeAt, sessionExists, sessionIdle, minAgeMs, debounceMs } = params
+  if (!sessionExists) return false
+  if (!sessionIdle) return false
+  if (oldestPendingAgeMs <= minAgeMs) return false
+  if (now - lastWakeAt < debounceMs) return false
+  return true
+}
+
+// I/O wrapper around shouldWakeMainAgent: probes the channel session's presence
+// and idle state, and on a positive decision injects the content-free nudge and
+// records the debounce timestamp. Called at most ONCE per tick (the caller gates
+// on a per-tick flag) so a backlog of main-agent messages triggers a single
+// readiness probe, not one per message. Async because isSessionReadyForPrompt
+// and sendPromptToSession are async (v1.22.2 upstream).
+async function maybeWakeMainAgent(oldestPendingAgeMs: number, now: number): Promise<void> {
+  // Cheap gates first so a fresh message or an in-debounce window skips the
+  // tmux capture-pane entirely (keep the tick's tmux I/O bounded).
+  if (oldestPendingAgeMs <= MAIN_WAKE_MIN_AGE_MS) return
+  if (now - _lastMainWakeAt < MAIN_WAKE_DEBOUNCE_MS) return
+  const sessionExists = sessionExistsOnHost(null, MAIN_CHANNELS_SESSION)
+  const sessionIdle = sessionExists && await isSessionReadyForPrompt(MAIN_CHANNELS_SESSION, null)
+  if (!shouldWakeMainAgent({
+    oldestPendingAgeMs, now, lastWakeAt: _lastMainWakeAt,
+    sessionExists, sessionIdle,
+    minAgeMs: MAIN_WAKE_MIN_AGE_MS, debounceMs: MAIN_WAKE_DEBOUNCE_MS,
+  })) return
+  try {
+    await sendPromptToSession(MAIN_CHANNELS_SESSION, MAIN_WAKE_NUDGE, null)
+    _lastMainWakeAt = now
+    logger.info({ session: MAIN_CHANNELS_SESSION, ageMs: oldestPendingAgeMs }, 'message-router: wake-nudged main agent (pending inbox, idle session)')
+  } catch (err) {
+    logger.warn({ err, session: MAIN_CHANNELS_SESSION }, 'message-router: main-agent wake-nudge failed')
+  }
+}
 
 // Bounce a terminal federated-delivery failure back to the SENDER's inbox as
 // a local 'system' notice, so a delegating agent learns its task never
@@ -401,7 +468,7 @@ export async function runMessageRouterTick(): Promise<void> {
     // on their own budget so neither queue starves the other.
     await deliverFederatedBatch(federatedPending, now)
 
-    let mainAgentWakeupFiredThisTick = false
+    let mainWakeCheckedThisTick = false
     for (const msg of pending) {
       // Skip messages already batched by the reconnect pre-pass: they are
       // 'done' in the DB now but still appear in our snapshot slice.
@@ -424,21 +491,17 @@ export async function runMessageRouterTick(): Promise<void> {
       // day. Leave the message pending; the next main-agent turn claims it
       // atomically. Sub-agents keep the tmux-inject path (they have idle gaps).
       //
-      // WAKEUP: without an active nudge the main agent only drains on the next
-      // user message or heartbeat -- up to 22+ min latency observed in prod.
-      // Fire one lightweight wakeup per cooldown window so an idle channels
-      // session starts a turn and drain-inbox claims the message immediately.
-      // Busy session: Claude Code queues the wakeup for the next turn boundary.
+      // Wake-nudge (kanban #96cd2ac9): to close the "up to 30 min until the next
+      // main-agent turn" latency, nudge the idle channel session with a
+      // CONTENT-FREE prompt so the drain hook fires now. IDLE-GATED (ours,
+      // preserved over v1.22.2 upstream cooldown): never inject mid-turn --
+      // shouldWakeMainAgent requires the session to be idle, avoiding the
+      // content-inject stall / mid-work interrupt. Still no content-inject and
+      // no markMessageDelivered here -- the pull path owns claim + framing.
       if (isMainAgent) {
-        if (!mainAgentWakeupFiredThisTick && now - lastMainAgentWakeupMs >= MAIN_AGENT_WAKEUP_COOLDOWN_MS) {
-          mainAgentWakeupFiredThisTick = true
-          lastMainAgentWakeupMs = now
-          try {
-            await sendPromptToSession(MAIN_CHANNELS_SESSION, '[inbox-wakeup: pending inter-agent messages]', null, { waitForIdle: false })
-            logger.info({ msgId: msg.id }, 'message-router: main-agent wakeup fired')
-          } catch (err) {
-            logger.warn({ err }, 'message-router: main-agent wakeup injection failed')
-          }
+        if (!mainWakeCheckedThisTick) {
+          mainWakeCheckedThisTick = true
+          await maybeWakeMainAgent(ageMs, now)
         }
         continue
       }
@@ -598,6 +661,13 @@ export async function runMessageRouterTick(): Promise<void> {
         routerLoggedMisses.delete(msg.id)
       }
     }
+
+    // Independently of the inter-agent queue above: wake idle sub-agents whose
+    // Telegram inbox (inbox-pending.jsonl) has stuck inbound messages the drain
+    // hook cannot pull without a turn. No-op unless SUBAGENT_TELEGRAM_WAKE_ENABLED
+    // (default off); when enabled it is cheap statSync-gated so an empty fleet
+    // costs one stat per agent and no tmux I/O.
+    void maybeWakeSubAgentsForTelegram(now)
 }
 
 // ---- voice helpers (message-router level) ----------------------------------

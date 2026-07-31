@@ -58,6 +58,162 @@ export function resolveTemplatePlaceholders(content: string): string {
   })
 }
 
+// Extract the hook script's basename from a command string, e.g.
+// "python3 /a/b/permission-router.py" -> "permission-router.py". Returns null
+// for commands with no script-file token (an inline shell command), which then
+// fall back to exact-string dedup. This is the key to path-INDEPENDENT dedup:
+// the same script seeded from the repo path and later rewritten to the runtime
+// path (install-critical-hooks.sh) share a basename but not a command string.
+export function hookScriptBasename(command: string): string | null {
+  for (const tok of command.trim().split(/\s+/)) {
+    if (/\.(py|mjs|cjs|js|sh)$/.test(tok)) {
+      const slash = tok.lastIndexOf('/')
+      return slash >= 0 ? tok.slice(slash + 1) : tok
+    }
+  }
+  return null
+}
+
+type HookLeaf = { command?: string; timeout?: number; [k: string]: unknown }
+type HookEntry = { hooks?: HookLeaf[]; [k: string]: unknown }
+
+// Merge the template's hook block into an existing hook block in place, adding
+// only the hooks the existing settings lack. Dedup is path-INDEPENDENT for
+// script hooks (by basename): a router seeded at the repo path is never
+// re-added when the settings already carry the same router rewritten to the
+// runtime path -- the 2026-07-17 dupla-router root cause (two PreToolUse '*'
+// routers -> every grant blocked). Non-script (inline) commands fall back to
+// exact-string dedup. Returns true if anything changed.
+export function mergeHookBlocks(
+  existingHooks: Record<string, unknown>,
+  tplHooks: Record<string, unknown>,
+): boolean {
+  let changed = false
+  for (const [event, handlers] of Object.entries(tplHooks)) {
+    if (!existingHooks[event]) {
+      // Event entirely missing: add it wholesale.
+      existingHooks[event] = handlers
+      changed = true
+      continue
+    }
+    const tplEntries = handlers as HookEntry[]
+    const existEntries = existingHooks[event] as HookEntry[]
+    // Commands already present -- by exact string AND by script basename.
+    const existingCommands = new Set(
+      existEntries.flatMap((e) => (e.hooks ?? []).map((h) => h.command).filter(Boolean)),
+    )
+    const existingScriptBasenames = new Set(
+      existEntries.flatMap((e) =>
+        (e.hooks ?? [])
+          .map((h) => (h.command ? hookScriptBasename(h.command) : null))
+          .filter((b): b is string => Boolean(b)),
+      ),
+    )
+    for (const tplEntry of tplEntries) {
+      // Add hooks that are missing (new group entry, preserving sibling hooks).
+      const newHooks = (tplEntry.hooks ?? []).filter((h) => {
+        if (!h.command) return false
+        if (existingCommands.has(h.command)) return false // exact match already present
+        const base = hookScriptBasename(h.command)
+        if (base && existingScriptBasenames.has(base)) return false // same script, different path
+        return true
+      })
+      if (newHooks.length > 0) {
+        existEntries.push({ ...tplEntry, hooks: newHooks })
+        changed = true
+      }
+      // Sync timeouts for hooks that already exist (exact command) with a stale timeout.
+      for (const tplHook of tplEntry.hooks ?? []) {
+        if (!tplHook.command || tplHook.timeout == null) continue
+        for (const existEntry of existEntries) {
+          for (const existHook of existEntry.hooks ?? []) {
+            if (existHook.command === tplHook.command && existHook.timeout !== tplHook.timeout) {
+              existHook.timeout = tplHook.timeout
+              changed = true
+            }
+          }
+        }
+      }
+    }
+  }
+  return changed
+}
+
+// The permission-router is a PreToolUse '*' gate that consumes each grant
+// single-use (store/approvals/<agent>.granted.json -> pop). It must run EXACTLY
+// ONCE per tool call. The main agent's settings ARE the user-global
+// ~/.claude/settings.json; every sub-agent process ALSO loads that same
+// user-global file (Claude Code layers user settings over the cwd's project
+// settings). So a '*' router in a sub-agent's agent-local settings.json runs a
+// SECOND time on top of the inherited user-global one -- the first run consumes
+// the grant, the second sees an emptied store and denies -> permanent
+// grant-loop (the recurring dupla-router incident). Canonical rule: the router
+// lives ONLY in user-global; sub-agent agent-local settings must not carry it.
+export const PERMISSION_ROUTER_SCRIPT = 'permission-router.py'
+
+// True if any PreToolUse hook in the block registers the permission-router
+// (path-independent, matched by script basename).
+export function hooksBlockHasPermissionRouter(hooks: unknown): boolean {
+  if (!hooks || typeof hooks !== 'object') return false
+  const pre = (hooks as Record<string, unknown>).PreToolUse
+  if (!Array.isArray(pre)) return false
+  return (pre as HookEntry[]).some((e) =>
+    (e?.hooks ?? []).some(
+      (h) => h?.command != null && hookScriptBasename(h.command) === PERMISSION_ROUTER_SCRIPT,
+    ),
+  )
+}
+
+// Remove every PreToolUse hook whose script is the permission-router, dropping
+// any group left empty. Mutates the hooks block in place; returns true if it
+// changed anything. Keeps the router out of sub-agent agent-local settings
+// (see PERMISSION_ROUTER_SCRIPT note). Idempotent: a second call is a no-op.
+export function stripPermissionRouterHooks(hooks: Record<string, unknown>): boolean {
+  const pre = hooks.PreToolUse
+  if (!Array.isArray(pre)) return false
+  let changed = false
+  const keptGroups: HookEntry[] = []
+  for (const group of pre as HookEntry[]) {
+    if (!group || !Array.isArray(group.hooks)) {
+      keptGroups.push(group)
+      continue
+    }
+    const keptHooks = group.hooks.filter((h) => {
+      const isRouter =
+        h?.command != null && hookScriptBasename(h.command) === PERMISSION_ROUTER_SCRIPT
+      if (isRouter) changed = true
+      return !isRouter
+    })
+    if (keptHooks.length === group.hooks.length) {
+      keptGroups.push(group)
+    } else if (keptHooks.length > 0) {
+      keptGroups.push({ ...group, hooks: keptHooks })
+    }
+    // else: the group was emptied by the strip -> drop it entirely
+  }
+  if (changed) hooks.PreToolUse = keptGroups
+  return changed
+}
+
+// Safety guard for the strip: does the shared user-global settings.json
+// currently register the permission-router? A sub-agent's agent-local copy is
+// only safe to remove when the inherited user-global one actually covers it --
+// otherwise stripping would leave the sub-agent UNGATED (worse than a grant-
+// loop). Read fresh each call; a missing/unparseable file -> false (keep the
+// local router). During startup the main agent is processed first (see
+// web.ts backfill loop), so user-global is populated before any sub-agent is
+// stripped.
+export function userGlobalHasPermissionRouter(): boolean {
+  const p = join(homedir(), '.claude', 'settings.json')
+  if (!existsSync(p)) return false
+  try {
+    const s = JSON.parse(readFileSync(p, 'utf-8')) as Record<string, unknown>
+    return hooksBlockHasPermissionRouter(s.hooks)
+  } catch {
+    return false
+  }
+}
+
 // Return the settings.json path for an agent.
 // The main agent's settings live at ~/.claude/settings.json (not inside agents/).
 // Exported so the startup self-heal (hook-registration-guard) can prune stale
@@ -74,8 +230,6 @@ export function agentSettingsPath(name: string): string {
 // the 2026-07-14 silent fleet-freeze incident.
 const _TMP_PREFIXES = ['/tmp/', '/var/tmp/', '/private/tmp/', '/dev/shm/']
 
-// Shared hook-entry type used by ensureAgentHooks and upgradeLegacyHookCommands.
-type HookEntry = { hooks?: Array<{ command?: string; timeout?: number; [k: string]: unknown }> }
 
 /**
  * Returns true when the command is unsafe to register in shared settings:
@@ -165,17 +319,28 @@ export function ensureAgentHooks(name: string): boolean {
     try { existing = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { /* overwrite */ }
   }
   const tplHooks = tpl.hooks as Record<string, unknown>
+  // Sub-agents inherit the '*' permission-router from user-global; registering
+  // it again agent-locally double-runs the single-use grant consume -> grant-
+  // loop (dupla-router root cause). Strip it from the template BEFORE merge so
+  // it is never (re)added here, and prune any copy an earlier seed already left
+  // behind. Guarded on userGlobalHasPermissionRouter() so a sub-agent is never
+  // left ungated if the shared file somehow lacks the router.
+  const stripRouter = name !== MAIN_AGENT_ID && userGlobalHasPermissionRouter()
+  if (stripRouter) stripPermissionRouterHooks(tplHooks)
   if (existing.hooks) {
-    // Merge strategy:
-    //   0. Upgrade pass: in-place replace any legacy bare hook commands with the
-    //      fail-open wrapper form (basename-matched). This runs before the add pass
-    //      so the exact-match dedup in step 2 sees the upgraded commands and skips
-    //      them -- avoiding the double-entry bug where the wrapper is added alongside
-    //      the old bare command.
-    //   1. If a hook event is entirely missing: add it wholesale.
-    //   2. If the event exists: add any template hook commands not yet present
-    //      as a new hook group entry (preserves existing hooks like telegram_progress.py).
-    //   3. Sync the timeout of any command hook whose command matches but timeout differs.
+    // Merge strategy (upstream upgrade-pass + our path-independent dupla-router guard):
+    //   0. Upgrade pass: in-place replace any legacy bare hook command with the
+    //      fail-open wrapper / template form (basename-matched). Runs first so the
+    //      exact-match dedup in step 2 sees the upgraded command and skips it,
+    //      avoiding the double-entry bug (wrapper added alongside the old command).
+    //   1. Missing event: add it wholesale.
+    //   2. Existing event: add template hooks not yet present. Dedup is by exact
+    //      command AND by script basename (path-INDEPENDENT): a router seeded at
+    //      the repo path is never re-added when the settings already carry the same
+    //      router rewritten to the runtime path -- the 2026-07-17 dupla-router root
+    //      cause (two PreToolUse '*' routers -> every grant blocked). Unsafe
+    //      (tmpfs / missing-path) commands are never registered (registration guard).
+    //   3. Sync the timeout of any exact-command hook whose timeout differs.
     const existingHooks = existing.hooks as Record<string, unknown>
     let changed = upgradeLegacyHookCommands(existingHooks, tplHooks)
     for (const [event, handlers] of Object.entries(tplHooks)) {
@@ -185,15 +350,26 @@ export function ensureAgentHooks(name: string): boolean {
       } else {
         const tplEntries = handlers as HookEntry[]
         const existEntries = existingHooks[event] as HookEntry[]
-        // Collect all command strings already present in this event's hook groups.
+        // Commands already present -- by exact string AND by script basename.
         const existingCommands = new Set(
           existEntries.flatMap((e) => (e.hooks ?? []).map((h) => h.command).filter(Boolean)),
         )
+        const existingScriptBasenames = new Set(
+          existEntries.flatMap((e) =>
+            (e.hooks ?? [])
+              .map((h) => (h.command ? hookScriptBasename(h.command) : null))
+              .filter((b): b is string => Boolean(b)),
+          ),
+        )
         for (const tplEntry of tplEntries) {
-          // Add hooks that are missing AND safe to register (registration guard).
-          const newHooks = (tplEntry.hooks ?? []).filter(
-            (h) => h.command && !existingCommands.has(h.command) && !isUnsafeHookCommand(h.command),
-          )
+          // Add hooks that are missing (exact + basename dedup) AND safe to register.
+          const newHooks = (tplEntry.hooks ?? []).filter((h) => {
+            if (!h.command) return false
+            if (existingCommands.has(h.command)) return false // exact match already present
+            const base = hookScriptBasename(h.command)
+            if (base && existingScriptBasenames.has(base)) return false // same script, different path
+            return !isUnsafeHookCommand(h.command) // registration guard
+          })
           if (newHooks.length > 0) {
             existEntries.push({ ...tplEntry, hooks: newHooks })
             changed = true
@@ -213,6 +389,12 @@ export function ensureAgentHooks(name: string): boolean {
         }
       }
     }
+    // Cross-file strip: prune any inherited '*' permission-router copy still
+    // present in the agent-local hooks. Complements the basename intra-file
+    // dedup above -- that stops a re-add during the merge; this removes a
+    // duplicate an earlier seed already wrote. Guarded on stripRouter so a
+    // sub-agent is never left ungated. (#52 dupla-router cross-file fix.)
+    if (stripRouter && stripPermissionRouterHooks(existingHooks)) changed = true
     if (!changed) return false
   } else {
     // No hooks yet: seed from template, filtering unsafe commands before writing.
@@ -300,12 +482,29 @@ export function writeAgentSettingsFromProfile(name: string, profile: ProfileTemp
   // hooks. Re-applied on every spawn (this function regenerates settings.json),
   // so they survive respawns. (a) email-send block -- outbound email routes
   // through the main agent. (b) self-pace block -- no ScheduleWakeup/Cron*/Bash
-  // self-injection. The MAIN_AGENT_ID is exempt from both. Merge/deploy is NOT
-  // gated: the operator authorizes those autonomously (so test/deploy runs are
-  // never blocked); the actual incident vector -- an agent answering its OWN
-  // posed question -- is covered by the self-pace block + the #0 CLAUDE.md doctrine.
+  // self-injection. (c) egress gate -- WebFetch calls that are not on the known
+  // API allowlist are hard-blocked and logged; arbitrary web content must go
+  // through the quarantine-reader sub-agent. The MAIN_AGENT_ID is exempt from
+  // (a) and (b) but NOT from (c) -- every agent can be hijacked via an injected
+  // WebFetch call, including the main one. Merge/deploy is NOT gated: the operator
+  // authorizes those autonomously (so test/deploy runs are never blocked); the
+  // actual incident vector -- an agent answering its OWN posed question -- is
+  // covered by the self-pace block + the #0 CLAUDE.md doctrine.
   if (agentGetsEmailGate(name)) injectEmailSendGate(existing)
   if (agentGetsGovernanceGates(name)) injectSelfPaceGate(existing)
+  injectEgressGate(existing)
+  // A sub-agent's '*' permission-router is inherited from user-global; a copy
+  // preserved in this agent-local file from an earlier seed would double-run
+  // the single-use grant consume -> grant-loop. Prune it on every respawn
+  // (guarded so we never leave the agent ungated). (dupla-router root fix.)
+  if (
+    name !== MAIN_AGENT_ID &&
+    userGlobalHasPermissionRouter() &&
+    existing.hooks &&
+    typeof existing.hooks === 'object'
+  ) {
+    stripPermissionRouterHooks(existing.hooks as Record<string, unknown>)
+  }
   atomicWriteFileSync(settingsPath, JSON.stringify(existing, null, 2))
 }
 
@@ -379,6 +578,79 @@ export function injectSelfPaceGate(existing: Record<string, unknown>): void {
   ]
 }
 
+// Idempotently wire the egress-gate PreToolUse hook (hard-blocks WebFetch to
+// any URL not on the known API allowlist, logs blocked calls). Applied to ALL
+// agents including MAIN_AGENT_ID -- the hook defends against prompt-injection
+// that exfiltrates data via an outbound WebFetch, and the main agent faces the
+// same risk as sub-agents. Same dedupe shape as the other gate injectors.
+export function injectEgressGate(existing: Record<string, unknown>): void {
+  const hooks = (existing.hooks && typeof existing.hooks === 'object'
+    ? existing.hooks
+    : (existing.hooks = {})) as Record<string, unknown>
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'hooks', 'egress-gate.mjs')}`
+  // Registration guard: a /tmp or missing path must never enter shared settings.
+  if (isUnsafeHookCommand(command)) return
+  const entry = {
+    matcher: 'WebFetch',
+    hooks: [{ type: 'command', command, timeout: 10 }],
+  }
+  const prev = Array.isArray(hooks.PreToolUse) ? (hooks.PreToolUse as unknown[]) : []
+  hooks.PreToolUse = [
+    ...prev.filter((e) => !JSON.stringify(e).includes('egress-gate.mjs')),
+    entry,
+  ]
+}
+
+// Idempotent migration: ensure every agent's settings.json carries the egress
+// gate hook. Called at server startup (alongside ensureAgentStalenessHook) so
+// the hook is applied to both existing and newly-created agents without a full
+// respawn. Returns true if the file was updated, false if already wired.
+export function ensureEgressGate(name: string): boolean {
+  const settingsPath = agentSettingsPath(name)
+  let settings: Record<string, unknown> = {}
+  if (existsSync(settingsPath)) {
+    try { settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) } catch { return false }
+  }
+  const command = `node ${join(PROJECT_ROOT, 'scripts', 'hooks', 'egress-gate.mjs')}`
+  const hooks = (settings.hooks && typeof settings.hooks === 'object')
+    ? settings.hooks as Record<string, unknown>
+    : {}
+  const ptu = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse as unknown[] : []
+  // Idempotency: already wired if any entry references the egress-gate script.
+  if (JSON.stringify(ptu).includes('egress-gate.mjs')) return false
+  if (isUnsafeHookCommand(command)) return false
+  injectEgressGate(settings)
+  if (name !== MAIN_AGENT_ID) mkdirSync(join(agentDir(name), '.claude'), { recursive: true })
+  atomicWriteFileSync(settingsPath, JSON.stringify(settings, null, 2))
+  return true
+}
+
+// Deploy the quarantine-reader sub-agent definition to an agent's
+// .claude/agents/ directory. The template lives in templates/agents/ (tracked
+// in git); sub-agent definitions under agents/ are gitignored at runtime.
+// Idempotent: only writes when the file is absent or the template is newer.
+// Returns true if the file was written, false if already up-to-date.
+export function ensureQuarantineReader(name: string): boolean {
+  const tplPath = join(PROJECT_ROOT, 'templates', 'sub-agents', 'quarantine-reader.md')
+  if (!existsSync(tplPath)) return false
+  let destDir: string
+  if (name === MAIN_AGENT_ID) {
+    destDir = join(homedir(), '.claude', 'agents')
+  } else {
+    destDir = join(agentDir(name), '.claude', 'agents')
+  }
+  mkdirSync(destDir, { recursive: true })
+  const destPath = join(destDir, 'quarantine-reader.md')
+  // Idempotency: already deployed when file exists and matches the template.
+  if (existsSync(destPath)) {
+    try {
+      if (readFileSync(destPath, 'utf-8') === readFileSync(tplPath, 'utf-8')) return false
+    } catch { /* fall through to re-write */ }
+  }
+  copyFileSync(tplPath, destPath)
+  return true
+}
+
 // Copy the repo's `scheduled-tasks/<task>/task-config.json` to the
 // destination with the `agent` field rewritten to the host's
 // MAIN_AGENT_ID. The repo-side configs ship with `"agent": "marveen"`
@@ -447,8 +719,14 @@ export function scaffoldAgentDir(name: string) {
   const dir = agentDir(name)
   mkdirSync(join(dir, '.claude', 'skills'), { recursive: true })
   mkdirSync(join(dir, '.claude', 'hooks'), { recursive: true })
+  mkdirSync(join(dir, '.claude', 'agents'), { recursive: true })
   mkdirSync(channelStateDir(CHANNEL_PROVIDER, dir), { recursive: true })
   mkdirSync(join(dir, 'memory'), { recursive: true })
+
+  // Deploy the quarantine-reader sub-agent definition from the template so every
+  // scaffolded agent can use it for safe web/RSS fetching without calling WebFetch
+  // directly in the main context (where untrusted content would run as instructions).
+  ensureQuarantineReader(name)
 
   // Initialize empty files if they don't exist
   const memoryMd = join(dir, 'memory', 'MEMORY.md')
@@ -472,7 +750,23 @@ export function scaffoldAgentDir(name: string) {
     const tplPath = join(PROJECT_ROOT, 'templates', 'settings.json.template')
     if (existsSync(tplPath)) {
       const resolved = resolveTemplatePlaceholders(readFileSync(tplPath, 'utf-8'))
-      atomicWriteFileSync(settingsJson, resolved)
+      // Strip the '*' permission-router from the seeded copy: a sub-agent
+      // inherits it from user-global, so a local copy double-registers it and
+      // loops every grant (dupla-router fix). Guarded so we never seed a
+      // sub-agent ungated; the main agent (not scaffolded here) keeps it.
+      if (name !== MAIN_AGENT_ID && userGlobalHasPermissionRouter()) {
+        try {
+          const obj = JSON.parse(resolved) as Record<string, unknown>
+          if (obj.hooks && typeof obj.hooks === 'object') {
+            stripPermissionRouterHooks(obj.hooks as Record<string, unknown>)
+          }
+          atomicWriteFileSync(settingsJson, JSON.stringify(obj, null, 2))
+        } catch {
+          atomicWriteFileSync(settingsJson, resolved)
+        }
+      } else {
+        atomicWriteFileSync(settingsJson, resolved)
+      }
     }
   }
 }
@@ -491,6 +785,12 @@ const FLEET_ROSTER_END = '<!-- END GENERATED: fleet-roster -->'
 // END in the file, eating unrelated content in between.
 const FLEET_ROSTER_BLOCK_RE = new RegExp(
   `${FLEET_ROSTER_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${FLEET_ROSTER_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+)
+
+const AUTONOMY_BEGIN = '<!-- BEGIN GENERATED: autonomy-wiring (auto-generated, do not edit by hand) -->'
+const AUTONOMY_END = '<!-- END GENERATED: autonomy-wiring -->'
+const AUTONOMY_BLOCK_RE = new RegExp(
+  `${AUTONOMY_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${AUTONOMY_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
 )
 
 // Builds the text body that goes between the BEGIN/END markers.
@@ -558,6 +858,68 @@ function buildFleetRosterBody(selfName: string): string {
     '',
     'Ha egy kérés egyértelműen más szakterületére esik, jelezd vagy delegáld inter-agent üzenettel a megfelelő ágensnek.',
   ].join('\n')
+}
+
+// Builds the autonomy-wiring section body. Static per agent name: the content
+// never changes based on runtime fleet state, but the curl examples embed the
+// resolved dashboard origin and the agent's own name so agents don't have to
+// guess.
+function buildAutonomyBody(name: string): string {
+  return [
+    '## Autonómia és jóváhagyás',
+    '',
+    'Az autonóm műveletek fokozatait a store/autonomy-config.json szabályozza (level: 1=csak jelez, 2=javasol+jóváhagyás, 3=autonóm+jelent). Mielőtt önállóan cselekszel, nézd meg az adott kategória szintjét.',
+    '',
+    '**Level 1 (csak jelez)**: küldj inter-agent értesítést a főágensnek, de NE végezd el a műveletet. Ezután ÁLLJ MEG.',
+    `curl -s -X POST ${dashboardOrigin}/api/messages -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d "{\\"from\\":\\"${name}\\",\\"to\\":\\"${MAIN_AGENT_ID}\\",\\"content\\":\\"[FELHÍVÁS] CATEGORY_KEY: MIT akartam elvégezni, de level 1 miatt csak jelzek.\\"}"`,
+    '',
+    '**Level 2 (jóváhagyás szükséges)**: kérj jóváhagyást az API-n MIELŐTT cselekszel.',
+    '',
+    'Jóváhagyás kérése (POST):',
+    `curl -s -X POST ${dashboardOrigin}/api/approvals -H "Content-Type: application/json" -H "Authorization: Bearer $(cat store/.dashboard-token)" -d '{"agent_id":"${name}","category":"CATEGORY_KEY","action_description":"Mit tervezel elvégezni és miért","timeout_seconds":3600}'`,
+    'A válaszban kapott id-vel kérdezheted le a döntést.',
+    '',
+    'Döntés lekérdezése (GET, 60 mp-enként ismételve):',
+    `curl -s -H "Authorization: Bearer $(cat store/.dashboard-token)" "${dashboardOrigin}/api/approvals/<id>"`,
+    'status=approved -> végezd el a műveletet. status=rejected vagy status=timeout -> ne csináld, naplózd az okot.',
+    '',
+    '**Level 3 (autonóm)**: elvégzed a műveletet, majd utána jelented a főágensnek.',
+  ].join('\n')
+}
+
+// Idempotently ensures the autonomy-wiring block is present and current in the
+// agent's CLAUDE.md. Called on every startAgentProcess() alongside
+// ensureFleetRosterSection() so that existing agents receive the block
+// automatically on respawn without manual migration.
+//
+// Idempotency contract mirrors ensureFleetRosterSection (five rules apply).
+export function ensureAutonomySection(name: string): void {
+  // The main agent's CLAUDE.md lives at PROJECT_ROOT, not inside agents/<name>/.
+  // Sub-agents use agentDir(name)/CLAUDE.md as usual.
+  const claudeMdPath = name === MAIN_AGENT_ID
+    ? join(PROJECT_ROOT, 'CLAUDE.md')
+    : join(agentDir(name), 'CLAUDE.md')
+  if (!existsSync(claudeMdPath)) return
+
+  const body = buildAutonomyBody(name)
+  const block = `${AUTONOMY_BEGIN}\n${body}\n${AUTONOMY_END}`
+
+  let existing: string
+  try {
+    existing = readFileSync(claudeMdPath, 'utf-8')
+  } catch {
+    return
+  }
+
+  let updated: string
+  if (AUTONOMY_BLOCK_RE.test(existing)) {
+    updated = existing.replace(AUTONOMY_BLOCK_RE, block)
+  } else {
+    updated = existing.trimEnd() + '\n\n' + block + '\n'
+  }
+
+  if (updated === existing) return
+  atomicWriteFileSync(claudeMdPath, updated)
 }
 
 // Idempotently ensures the fleet roster block is present and current in the
@@ -740,11 +1102,14 @@ Output ONLY the markdown content, no code fences.`
   if (cleaned.startsWith('```')) {
     cleaned = cleaned.replace(/^```\w*\n?/, '').replace(/\n?```$/, '')
   }
-  // Append the marker-delimited fleet roster block using the same
-  // buildFleetRosterBody() as ensureFleetRosterSection() -- single source of truth.
-  // Appended after LLM output so the model never sees or can rewrite it.
-  const body = buildFleetRosterBody(name)
-  cleaned = cleaned.trimEnd() + '\n\n' + FLEET_ROSTER_BEGIN + '\n' + body + '\n' + FLEET_ROSTER_END + '\n'
+  // Append marker-delimited sections after LLM output so the model can never
+  // see or rewrite them. Single source of truth: same builders as the
+  // ensure*Section() functions used on every subsequent respawn.
+  const fleetBody = buildFleetRosterBody(name)
+  const autonomyBody = buildAutonomyBody(name)
+  cleaned = cleaned.trimEnd()
+    + '\n\n' + FLEET_ROSTER_BEGIN + '\n' + fleetBody + '\n' + FLEET_ROSTER_END
+    + '\n\n' + AUTONOMY_BEGIN + '\n' + autonomyBody + '\n' + AUTONOMY_END + '\n'
   return cleaned
 }
 

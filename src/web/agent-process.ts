@@ -35,13 +35,14 @@ import {
 } from './ssh-tmux.js'
 import { parseTelegramToken } from './telegram.js'
 import { getProvider, getProviderType, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
-import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT } from '../config.js'
+import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBOX_TEE } from '../config.js'
 import { getEffectiveSettingValue } from '../settings-store.js'
 import { loadProfileTemplate } from './profiles.js'
 import { resolveAgentSecurityProfile } from './agent-team.js'
-import { writeAgentSettingsFromProfile, ensureFleetRosterSection } from './agent-scaffold.js'
+import { writeAgentSettingsFromProfile, ensureFleetRosterSection, ensureAutonomySection } from './agent-scaffold.js'
 import { schedulePluginUnlockAfterRespawn } from './channel-plugin-unlock.js'
 import { getSecret } from './vault.js'
+import { resolveOpenRouterModel } from './openrouter-models.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes } from './channel-poller-reap.js'
 import { MAIN_CHANNELS_SESSION } from './main-agent.js'
 import { notifyChannel } from '../notify.js'
@@ -115,6 +116,21 @@ export function ownChannelProviderForScope(
   resolvedProvider: string | null,
 ): string | null {
   return hasOwnToken && resolvedProvider ? resolvedProvider : null
+}
+
+// Wrap the telegram plugin's bun stdio server in a tee that persists each
+// inbound channel notification to <stateDir>/inbox-pending.jsonl, which the
+// channel-inbox-drain UserPromptSubmit hook then pulls into the next turn.
+// Sub-agents load the plugin as a plain MCP server, so Claude Code drops its
+// channel notifications; this tee is what makes SUBAGENT_TELEGRAM_WAKE_ENABLED
+// have an inbox to wake on.
+export function buildTelegramMcpServerConfig(bunBin: string, pluginDir: string, stateDir: string) {
+  const wrapper = join(PROJECT_ROOT, 'scripts', 'channel-inbound-tee.mjs')
+  return {
+    command: 'node',
+    args: [wrapper, bunBin, 'run', '--cwd', pluginDir, '--shell=bun', '--silent', 'start'],
+    env: { TELEGRAM_STATE_DIR: stateDir },
+  }
 }
 
 // The fleet's shared long-lived OAuth token (from `claude setup-token`), stored
@@ -785,11 +801,16 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
       logger.warn({ err, name }, 'pre-launch detached-claude reap failed (continuing)')
     }
 
-    const model = readAgentModel(name)
+    // `openrouter-auto:<tier>` resolves to the tier's current recommended model
+    // (weekly-refreshed); a concrete OpenRouter id (contains '/') passes through.
+    const model = resolveOpenRouterModel(readAgentModel(name))
     const authMode = readAgentAuthMode(name)
     const isClaude = model.startsWith('claude-')
     const isDeepseek = model.startsWith('deepseek-')
-    const isOllama = !isClaude && !isDeepseek
+    // OpenRouter model ids are `provider/model` (contain '/'); Ollama tags use
+    // ':' and no '/'. This discriminator keeps OpenRouter ids off the Ollama path.
+    const isOpenRouter = !isClaude && !isDeepseek && model.includes('/')
+    const isOllama = !isClaude && !isDeepseek && !isOpenRouter
     // ANTHROPIC_MODEL is REQUIRED for non-Claude models: the interactive TUI
     // validates the `--model` flag against known Anthropic models and silently
     // falls back to the built-in default (claude-opus-...) for an unrecognized
@@ -800,6 +821,10 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     const ollamaEnv = isOllama ? `export ANTHROPIC_AUTH_TOKEN=ollama && export ANTHROPIC_BASE_URL=${OLLAMA_URL} && export ANTHROPIC_MODEL='${model}' && ` : ''
     const deepseekKey = isDeepseek ? (getSecret('DEEPSEEK_API_KEY') ?? '') : ''
     const deepseekEnv = isDeepseek ? `export ANTHROPIC_AUTH_TOKEN="${deepseekKey}" && export ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic && export ANTHROPIC_MODEL='${model}' && ` : ''
+    // OpenRouter: Anthropic-compatible endpoint at https://openrouter.ai/api
+    // (the SDK appends /v1/messages). Key from the vault (openrouter-fleet-key).
+    const openrouterKey = isOpenRouter ? (getSecret('openrouter-fleet-key') ?? '') : ''
+    const openrouterEnv = isOpenRouter ? `export ANTHROPIC_AUTH_TOKEN="${openrouterKey}" && export ANTHROPIC_BASE_URL=https://openrouter.ai/api && export ANTHROPIC_MODEL='${model}' && ` : ''
     // When authMode is 'api', the agent uses its own ANTHROPIC_API_KEY from
     // the vault instead of the host's OAuth. The vault entry ID follows the
     // convention `agent-{name}-api-key`. We inject it as an env var so Claude
@@ -821,6 +846,7 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     const profile = loadProfileTemplate(resolveAgentSecurityProfile(name))
     writeAgentSettingsFromProfile(name, profile)
     ensureFleetRosterSection(name)
+    ensureAutonomySection(name)
     // A sub-agent must load ONLY its own channel plugin. The user-scope
     // enabledPlugins would otherwise make EVERY sub-agent spawn a telegram
     // (and slack/discord) poller that falls back to the main agent's bot
@@ -840,21 +866,64 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     // its channel comes up via channels.sh -- but if a future caller ever passed
     // MAIN_AGENT_ID in, scopeChannelPlugins(null) would DISABLE the owner's
     // telegram channel (Szabi's primary line). Refuse outright.
+    //
+    // Telegram agents use a per-agent .mcp.json to spawn their own bun process
+    // instead of the shared --channels flag path. The --channels path goes
+    // through the plugin's .in_use/<pid> lock: if one process already holds the
+    // lock, every other agent that starts with --channels gets "already in use"
+    // and ends up with No MCP servers configured -- no bun, no bot.pid, deaf to
+    // inbound Telegram. The mcp.json path bypasses the lock: Claude Code spawns a
+    // fresh bun stdio server per agent, each with its own TELEGRAM_STATE_DIR. The
+    // stdio tee wrapper restores inbound delivery by persisting notifications to a
+    // local inbox that the UserPromptSubmit drain hook pulls into context.
+    //
+    // OPT-IN / DEFAULT OFF (SUBAGENT_INBOX_TEE). This mcp.json+tee swap is a
+    // delivery-path change: it writes inbound message content to a local inbox
+    // file for the drain hook to pull. With the flag off, telegram sub-agents
+    // keep the upstream `--channels` path unchanged and nothing is written to
+    // disk. Only opt in together with the channel-inbox-drain hook + (optionally)
+    // SUBAGENT_TELEGRAM_WAKE_ENABLED.
+    let useMcpJsonForChannel = false
+    if (SUBAGENT_INBOX_TEE && hasChannel && agentProvider === 'telegram' && name !== MAIN_AGENT_ID) {
+      try {
+        const pluginCacheDir = join(homedir(), '.claude', 'plugins', 'cache', 'claude-plugins-official', 'telegram')
+        const versions = existsSync(pluginCacheDir)
+          ? readdirSync(pluginCacheDir).filter(v => /^\d+\.\d+\.\d+$/.test(v)).sort().reverse()
+          : []
+        const pluginVersion = versions[0] ?? '0.0.6'
+        const pluginDir = join(pluginCacheDir, pluginVersion)
+        const bunBin = join(homedir(), '.bun', 'bin', 'bun')
+        // The agent working-dir .mcp.json (NOT .claude/mcp.json) is what Claude Code
+        // loads as project-scope MCP config. An empty .mcp.json already present would
+        // override .claude/mcp.json, so write to the same file Claude Code reads.
+        const mcpJsonPath = join(agentDir(name), '.mcp.json')
+        const mcpConfig = {
+          mcpServers: {
+            'plugin:telegram:telegram': buildTelegramMcpServerConfig(bunBin, pluginDir, agentChannelDir),
+          },
+        }
+        writeFileSync(mcpJsonPath, JSON.stringify(mcpConfig, null, 2))
+        useMcpJsonForChannel = true
+        logger.info({ name, pluginVersion, pluginDir }, 'Wrote per-agent mcp.json for telegram plugin')
+      } catch (err) {
+        logger.warn({ err, name }, 'Could not write mcp.json for telegram agent; falling back to --channels flag')
+      }
+    }
+
     if (name !== MAIN_AGENT_ID) {
       const settingsPath = join(agentDir(name), '.claude', 'settings.json')
       try {
         const s = JSON.parse(readFileSync(settingsPath, 'utf-8')) as Record<string, unknown>
-        // Gate the enable decision on the SAME signal as the --channels launch
-        // flag: a real own bot token in this agent's channel .env (token, above).
-        // A genuine own-token agent enables its own provider's plugin; a channel-
-        // less agent (no own token, only the legacy/global fallback that still
-        // marks hasChannel) yields null -> all providers disabled, so it never
-        // fights the main agent over the shared getUpdates slot. Keying on the
-        // explicit channelProvider config field instead (always null for sub-agents)
-        // was the regression that disabled the plugin for every legitimately-
-        // channelled sub-agent after a respawn (truly-unreachable plugin, no poller).
+        // When mcp.json is used for the telegram plugin, force enabledPlugins.telegram
+        // to false so Claude Code does not ALSO load the plugin via the marketplace
+        // enabledPlugins path -- that would spawn a second bun process and produce
+        // 409 Conflict / poller races. When --channels is still used (non-telegram
+        // providers or mcp.json write failure), keep the original token-gated logic.
+        const scopeProvider = useMcpJsonForChannel
+          ? null
+          : ownChannelProviderForScope(!!token, agentProvider)
         s.enabledPlugins = scopeChannelPlugins(
-          ownChannelProviderForScope(!!token, agentProvider),
+          scopeProvider,
           s.enabledPlugins as Record<string, boolean> | undefined,
         )
         writeFileSync(settingsPath, JSON.stringify(s, null, 2))
@@ -955,7 +1024,14 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     const channelSetup = hasChannel
       ? `export ${stateEnvVar}="${agentChannelDir}"${auditLogEnv} && `
       : ''
-    const channelFlag = hasChannel ? `--channels plugin:${provider.pluginId}` : ''
+    // When the per-agent mcp.json+tee path is active (SUBAGENT_INBOX_TEE), the
+    // plugin is already loaded as a plain MCP server, so ALSO passing --channels
+    // would register the plugin a SECOND way -- a duplicate poller racing the tee
+    // process over the same getUpdates slot. Suppress --channels in that case and
+    // rely solely on mcp.json (enabledPlugins is already forced false above for
+    // the same reason). Every other agent (non-telegram, main, or flag off) keeps
+    // the --channels launch path unchanged.
+    const channelFlag = hasChannel && !useMcpJsonForChannel ? `--channels plugin:${provider.pluginId}` : ''
     // Channel-plugin MCP-registration guard (2026-06-23): the telegram/slack/etc.
     // channel plugin registers as a stdio MCP server loaded via --channels. Claude
     // Code connects stdio MCP servers in batches of MCP_SERVER_CONNECTION_BATCH_SIZE
@@ -983,7 +1059,7 @@ export function startAgentProcess(name: string, opts: { fresh?: boolean } = {}):
     const promptSuggestionEnv = 'export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false && '
     // Single-quote `${model}` so values like `claude-opus-4-8[1m]` (1M-context
     // suffix) are not glob-expanded by the shell that tmux spawns the command in.
-    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${ollamaEnv}${deepseekEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model '${model}' ${channelFlag}`.trimEnd()
+    const cmd = `export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${ollamaEnv}${deepseekEnv}${openrouterEnv}cd "${dir}" && ${claudeBin()} ${continueFlag}${skipFlag}--model '${model}' ${channelFlag}`.trimEnd()
     runTmux(null, ['new-session', '-d', '-s', session, cmd], { timeout: 10000 })
 
     logger.info({ name, session, channelDir: agentChannelDir }, 'Agent tmux session started')
@@ -1678,5 +1754,26 @@ export async function clearStaleParkedInput(session: string, host: string | null
   unwedgeAttempts.set(key, { last: nowMs, sig: parked, fails: 0, escalated: false })
   logger.warn({ session, parked: parked.slice(0, 60) }, 'message-router: cleared stale parked input (channel un-wedge)')
   return true
+}
+
+// Fork-only: live-switch a running session's model via the /model slash command
+// (used by opus-escalation-runner). Types the command literally so the model id's
+// `[1m]` suffix is not parsed as tmux key names, accepts the confirm dialog, and
+// verifies the "Set model to" confirmation in the pane.
+export function switchModelLive(session: string, host: string | null, modelId: string): boolean {
+  try {
+    // -l = literal text, so the model id (incl. the `[1m]` suffix) is typed as-is
+    // rather than being parsed as tmux key names.
+    runTmux(host, ['send-keys', '-t', session, '-l', `/model ${modelId}`], { timeout: 5000 })
+    runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
+    // Let the confirm dialog render, then accept it.
+    execFileSync('/bin/sleep', ['0.5'], { timeout: 2000 })
+    runTmux(host, ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
+    execFileSync('/bin/sleep', ['0.5'], { timeout: 2000 })
+    const pane = capturePane(session, host)
+    return pane != null && /Set model to/i.test(pane)
+  } catch {
+    return false
+  }
 }
 

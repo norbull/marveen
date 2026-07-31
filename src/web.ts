@@ -9,7 +9,7 @@ import { isBlockedCrossOriginWrite, originMatchesServedHost } from './web/csrf-o
 import { json } from './web/http-helpers.js'
 import { detectLanIp } from './web/network-info.js'
 import { AGENTS_BASE_DIR, listAgentNames } from './web/agent-config.js'
-import { ensureAgentHooks, ensureAgentStalenessHook, ensureDefaultScheduledTasks, agentSettingsPath } from './web/agent-scaffold.js'
+import { ensureAgentHooks, ensureAgentStalenessHook, ensureEgressGate, ensureQuarantineReader, ensureDefaultScheduledTasks, agentSettingsPath, ensureAutonomySection } from './web/agent-scaffold.js'
 import { shouldRegisterHooks, pruneStaleHooksFromSettingsFile } from './web/hook-registration-guard.js'
 import { refreshMarveenBotUsername } from './web/telegram.js'
 import { startMessageRouter } from './web/message-router.js'
@@ -23,12 +23,17 @@ import { startInboxNudgeWatcher } from './web/inbox-nudge-watcher.js'
 import { startStuckToolCallWatcher } from './web/stuck-tool-call-watcher.js'
 import { startReauthHealer } from './web/reauth-healer.js'
 import { startAutoRestartRunner } from './web/auto-restart-runner.js'
+import { startContextCleanRunner } from './web/context-clean-runner.js'
+import { startStuckAgentWatcher } from './web/stuck-agent-watcher.js'
+import { startTaskPickupRunner } from './web/task-pickup-runner.js'
 import { startModelFallbackRunner } from './web/model-fallback-runner.js'
+import { startOpusEscalationRunner } from './web/opus-escalation-runner.js'
 import { startContextGuardRunner } from './web/context-guard-runner.js'
 import { collectTokenUsage } from './web/token-usage.js'
 import { logger } from './logger.js'
 import { tryHandleProfiles } from './web/routes/profiles.js'
 import { tryHandleMessages } from './web/routes/messages.js'
+import { tryHandleChannelSend } from './web/routes/channel-send.js'
 import { tryHandleFederation } from './web/routes/federation.js'
 import { identifyFederationCaller } from './web/federation/config.js'
 import { startFederationPoller } from './web/federation/poller.js'
@@ -57,6 +62,7 @@ import { tryHandleUpdates } from './web/routes/updates.js'
 import { tryHandleOnboarding } from './web/routes/onboarding.js'
 import { tryHandleStatus } from './web/routes/status.js'
 import { tryHandleAutonomy } from './web/routes/autonomy.js'
+import { tryHandleApprovals, startApprovalTimeoutSweeper } from './web/routes/approvals.js'
 import { tryHandleTokenUsage } from './web/routes/token-usage.js'
 import { tryHandleCosts, startCostsSyncTask } from './web/routes/costs.js'
 import { tryHandleIdeas } from './web/routes/ideas.js'
@@ -200,6 +206,7 @@ export function startWebServer(port = 3420): http.Server {
 
       if (await tryHandleProfiles(routeCtx)) return
       if (await tryHandleMessages(routeCtx)) return
+      if (await tryHandleChannelSend(routeCtx)) return
       if (await tryHandleFederation(routeCtx)) return
       if (await tryHandleDailyLog(routeCtx)) return
       if (await tryHandleMemories(routeCtx)) return
@@ -223,6 +230,7 @@ export function startWebServer(port = 3420): http.Server {
       if (await tryHandleOnboarding(routeCtx)) return
       if (await tryHandleStatus(routeCtx)) return
       if (await tryHandleAutonomy(routeCtx)) return
+      if (await tryHandleApprovals(routeCtx)) return
       if (await tryHandleTokenUsage(routeCtx)) return
       if (await tryHandleCosts(routeCtx)) return
       if (await tryHandleIdeas(routeCtx)) return
@@ -403,8 +411,20 @@ export function startWebServer(port = 3420): http.Server {
   const autoRestartInterval = webOnly ? undefined : startAutoRestartRunner()
   if (!webOnly) logger.info('Auto-restart runner started (60s poll, 40s offset)')
 
+  const contextCleanInterval = webOnly ? undefined : startContextCleanRunner()
+  if (!webOnly) logger.info('Context-clean runner started (60s poll, 50s offset)')
+
+  const stuckAgentInterval = webOnly ? undefined : startStuckAgentWatcher()
+  if (!webOnly) logger.info('Stuck-agent watcher started (60s poll, 55s offset)')
+
+  const taskPickupInterval = webOnly ? undefined : startTaskPickupRunner()
+  if (!webOnly) logger.info('Task-pickup runner started (60s poll, 57s offset)')
+
   const modelFallbackInterval = webOnly ? undefined : startModelFallbackRunner()
   if (!webOnly) logger.info('Model-fallback runner started (60s poll, 50s offset)')
+
+  const opusEscalationInterval = webOnly ? undefined : startOpusEscalationRunner()
+  if (!webOnly) logger.info('Opus-escalation runner started (60s poll, 55s offset)')
 
   const contextGuardInterval = webOnly ? undefined : startContextGuardRunner()
   if (!webOnly) logger.info('Context-guard runner started (5min poll, 4.5min initial delay)')
@@ -420,6 +440,9 @@ export function startWebServer(port = 3420): http.Server {
 
   // Collect token usage from JSONL transcripts every hour so the run-history
   // token estimates stay fresh without requiring a manual dashboard visit.
+  // Sweep timed-out pending approvals every minute
+  const approvalTimeoutInterval = startApprovalTimeoutSweeper()
+
   const tokenCollectInterval = webOnly ? undefined : setInterval(() => {
     collectTokenUsage().catch(err => logger.warn({ err }, 'Periodic token usage collection failed'))
   }, 60 * 60 * 1000)
@@ -454,7 +477,10 @@ export function startWebServer(port = 3420): http.Server {
   // (do NOT copy the hook backfill's ungated placement). The ensure heals
   // the two known loss vectors: update.sh --regen-claudemd and a stale
   // dashboard-editor buffer PUT.
-  if (!webOnly) ensureFederationClaudeMdSection()
+  if (!webOnly) {
+    ensureFederationClaudeMdSection()
+    ensureAutonomySection(MAIN_AGENT_ID)
+  }
 
   // Backfill the PreCompact hook into existing agents' settings.json so the
   // auto-skill / auto-memory flow runs on context compaction. No-op if the
@@ -472,6 +498,7 @@ export function startWebServer(port = 3420): http.Server {
     try {
       const patched: string[] = []
       const stalePatched: string[] = []
+      const egressPatched: string[] = []
       const pruned: string[] = []
       // Include the main agent (MAIN_AGENT_ID) so the voice hook is also seeded
       // into ~/.claude/settings.json alongside existing hooks (e.g. telegram_progress.py).
@@ -482,10 +509,13 @@ export function startWebServer(port = 3420): http.Server {
         pruned.push(...pruneStaleHooksFromSettingsFile(agentSettingsPath(agentName)))
         if (ensureAgentHooks(agentName)) patched.push(agentName)
         if (ensureAgentStalenessHook(agentName)) stalePatched.push(agentName)
+        if (ensureEgressGate(agentName)) egressPatched.push(agentName)
+        ensureQuarantineReader(agentName)
       }
       if (pruned.length) logger.info({ pruned }, 'Stale hook entries pruned from agent settings.json')
       if (patched.length) logger.info({ patched }, 'PreCompact hook backfilled into agent settings.json')
       if (stalePatched.length) logger.info({ patched: stalePatched }, 'staleness-guard UserPromptSubmit hook backfilled into agent settings.json')
+      if (egressPatched.length) logger.info({ patched: egressPatched }, 'egress-gate WebFetch hook backfilled into agent settings.json')
     } catch (err) {
       logger.warn({ err }, 'Agent hook backfill skipped')
     }
@@ -523,8 +553,12 @@ export function startWebServer(port = 3420): http.Server {
     if (inboxNudgeInterval) clearInterval(inboxNudgeInterval)
     if (reauthHealerInterval) clearInterval(reauthHealerInterval)
     clearInterval(autoRestartInterval)
+    clearInterval(contextCleanInterval)
+    clearInterval(stuckAgentInterval)
+    clearInterval(taskPickupInterval)
     clearInterval(modelFallbackInterval)
     clearInterval(contextGuardInterval)
+    clearInterval(approvalTimeoutInterval)
     clearInterval(updateCheckerInterval)
     if (federationPollerInterval) clearInterval(federationPollerInterval)
     if (capabilityRunnerInterval) clearInterval(capabilityRunnerInterval)

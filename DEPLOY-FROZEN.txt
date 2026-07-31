@@ -1,0 +1,15 @@
+DEPLOY FROZEN -- 2026-06-28
+
+A develop (30c339b: upstream sync + B fresh-fallback + 35fdef8 per-agent mcp.json)
+HTTP-szerver HANG-et okoz eles futasban: a /api/agents latencia 73ms -> 9.3s -> 12s
+-> 000 kb 5 perc alatt (progressziv lassulas, event-loop fojtas; a port LISTEN marad
+de a szerver nem valaszol). Kulso latencia-probe (nova) es belso ellenorzes is fogta.
+
+ROLLBACK-olva: a futo rendszer a regi/jo kodon fut (dashboard 200, channel HEALTHY).
+
+>>> A working tree DETACHED HEAD-en a sync-elotti jo 1f5c3c6-on all (rebuild-safe). <<<
+NE build-elj a develop-bol (30c339b) amig a HTTP-hang diagnozis + fix nincs kesz,
+kulonben egy rebuild csendben visszadeployolja a hang-et (rebuild-footgun).
+
+Hibas build megorizve diagnozishoz: dist-bad-30c339b/
+Diagnozis + re-deploy kapu (post-deploy latencia-canary): kanban 2e351606

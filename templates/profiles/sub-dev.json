@@ -6,6 +6,11 @@
   "filesystem": {
     "allow": [],
     "deny": [
+      "Read(${HOME}/.git-credentials)",
+      "Read(**/.git-credentials)",
+      "Read(${HOME}/.config/git/credentials)",
+      "Read(${HOME}/.env)",
+      "Read(**/.env)",
       "mcp__claude_ai_Supabase__*"
     ]
   }

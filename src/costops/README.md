@@ -39,15 +39,82 @@ it never fabricates numbers and never blocks the rest of the app.
 }
 ```
 
-## API (Bearer-gated, read-only)
+## Cost circuit-breaker (enforcement core)
+
+`circuit-breaker.ts` is the client-deliverable governance enforcement layer for
+**paid generation**. Unlike the display-only monthly budget above, these caps are
+meant to be **enforced before a paid generation** by the future generation
+pipeline (no such pipeline exists in this repo yet -- the core stands ready and
+fully unit-tested, wired to nothing). Pure decision logic + a small
+`deliverable_attempts` ledger; `db`/`now` passed in.
+
+Four responsibilities:
+
+- **retry cap** -- `evaluateRetry`: `max_retries` retries per deliverable, then
+  the next failure returns `hold_awaiting_approval`.
+- **fail classification** -- `classifyFail`: the same `client_id` + `fail_code`
+  reaching `systematic_threshold` is systematic (pull in a human, stop retrying).
+- **budget cap** -- `checkBudget`: provider-agnostic paid spend, aggregated from
+  the raw `cost_line_items` (not the monthly summary): today's total vs
+  `daily_cap` and a project's cumulative total vs `project_cap`, in `currency`.
+  Returns `hard_hold` when either cap is reached.
+- **model fallback** -- `modelFallback`: a consistently failing model is never
+  auto-swapped; it escalates to Orin (`orin_decision`).
+
+Decisions resolve to one enum (`allow | retry | hold_awaiting_approval |
+hard_hold | orin_decision`). `hold_awaiting_approval` maps onto the EXISTING
+kanban mechanism (card `waiting` + BLOKK label + comment) -- no new status.
+
+`FAIL_CODES` in `circuit-breaker.ts` is the canonical code home for the Iris
+QC-rubric fail taxonomy (11 codes); keep it in sync with the rubric doc.
+
+Caps live in the same local config under a `circuit_breaker` block (defaults:
+`daily_cap` 5, `project_cap` 20 USD, `max_retries` 2, `systematic_threshold` 2):
+
+```json
+"circuit_breaker": { "currency": "USD", "daily_cap": 5, "project_cap": 20, "max_retries": 2, "systematic_threshold": 2 }
+```
+
+## Pricing table (deriving usage cost)
+
+Paid providers (fal.ai, Kling, Seedance, ...) do **not** return a cost in their
+API response, so a usage charge must be *derived* from provider + model + how
+much was consumed. `pricing.ts` does exactly that against a config-only price
+table (a `pricing` block in `store/costops-config.json`, same gitignored home as
+the operator's other real amounts -- prices are never hard-coded in tracked
+source, where a stale snapshot would silently produce wrong cost data):
+
+```json
+"pricing": [
+  { "provider": "fal.ai", "model": "fal-ai/flux-pro/kontext", "unit_price": 0.04, "unit": "image", "currency": "USD" },
+  { "provider": "fal.ai", "model": "", "unit_price": 0, "unit": "image", "currency": "USD" }
+]
+```
+
+`model: ""` is a provider-wide fallback; a longer configured model that is a
+prefix of the requested one wins (so a specific entry beats a family entry).
+With no matching price the estimator returns null and the caller must supply an
+explicit `billed_cost` -- it never fabricates a number.
+
+## API (Bearer-gated)
 
 - `GET /api/costs/summary` -- monthly spend, forecast, per-source and confidence
-  breakdown, budget status, and token-usage volume. On read it idempotently
-  reflects the config's fixed costs into the ledger (upsert by dedup_key).
+  breakdown, budget status, and token-usage volume. Read-only (the fixed-cost
+  reflection runs on its own timer, never as a GET side effect).
 - `GET /api/costs/sources` -- active cost sources.
 - `GET /api/costs/budgets` -- configured budgets.
+- `GET /api/costs/budget-check?project=<p>[&provider=&model=&quantity=]` --
+  pre-flight paid-generation gate (wraps `circuit-breaker.checkBudget`). Hit it
+  BEFORE a paid generation: `action: 'hard_hold'` means a daily/project cap is
+  already reached, do not spend. Optional provider/model/quantity add a
+  pre-flight cost estimate and `would_exceed_daily`/`would_exceed_project`.
+- `POST /api/costs/usage` -- record one paid-usage charge (the only
+  client-triggered ledger write; validated, idempotent on the dedup ref). Supply
+  `billed_cost` explicitly, OR omit it and let the price table derive it from
+  `provider` + `service_name`/`model` (+ `consumed_quantity`), recorded at
+  confidence `estimate`. No configured price with no `billed_cost` -> 400.
 
-No client writes, no LLM, no provider API, no secrets in any response.
+No secrets in any response; the GET endpoints never write.
 
 ## Guardrails
 

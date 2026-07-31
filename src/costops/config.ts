@@ -56,11 +56,52 @@ export interface BudgetEntry {
   hard_threshold?: number     // fraction, default 1.0
 }
 
+// Cost circuit-breaker caps. Separate from the display-only monthly BudgetEntry:
+// these are ENFORCED before a paid generation and use a different aggregation
+// (per-DAY total spend + per-PROJECT cumulative spend, provider-agnostic, in
+// `currency`). Consumed by costops/circuit-breaker.ts. Every field is optional
+// in the JSON; missing fields fall back to DEFAULT_CIRCUIT_BREAKER.
+export interface CircuitBreakerConfig {
+  currency: string             // caps + eligible usage-line currency (default 'USD')
+  daily_cap: number            // total paid spend/day before hard-hold (default 5)
+  project_cap: number          // cumulative paid spend/project before hard-hold (default 20)
+  max_retries: number          // retries allowed per deliverable; the next fail holds (default 2)
+  systematic_threshold: number // same client+fail_code count that flags systematic (default 2)
+}
+
+export const DEFAULT_CIRCUIT_BREAKER: CircuitBreakerConfig = {
+  currency: 'USD',
+  daily_cap: 5,
+  project_cap: 20,
+  max_retries: 2,
+  systematic_threshold: 2,
+}
+
+// A per-model price for deriving a paid usage charge, since providers don't
+// return the cost in their API response (see costops/pricing.ts). Config-only,
+// never hard-coded in tracked source. `model` empty/absent = provider-wide
+// fallback; a longer model that prefixes the requested one wins (see findPrice).
+export interface PriceEntry {
+  provider: string        // 'fal.ai' | 'openrouter' | 'kling' | ...
+  model?: string          // 'fal-ai/flux-pro/kontext', '' for provider-wide
+  unit_price: number      // price per unit in `currency` (>= 0)
+  unit?: string           // 'image' | 'second' | 'call' | 'token' | ... (default 'call')
+  currency?: string       // defaults to the circuit-breaker currency (USD)
+  notes?: string
+}
+
 export interface CostOpsConfig {
   version: number
   currency: string
   fixed_costs: FixedCostEntry[]
   budgets: BudgetEntry[]
+  // Optional in a hand-written config object, but loadCostopsConfig always
+  // populates it (defaults when the JSON omits the block) -- resolve via
+  // resolveCircuitBreaker() at any call site to be safe.
+  circuit_breaker?: CircuitBreakerConfig
+  // Per-model prices for deriving paid usage charges (providers don't return
+  // cost). loadCostopsConfig always populates it ([] when the JSON omits it).
+  pricing?: PriceEntry[]
 }
 
 const EMPTY_CONFIG: CostOpsConfig = {
@@ -68,6 +109,8 @@ const EMPTY_CONFIG: CostOpsConfig = {
   currency: 'HUF',
   fixed_costs: [],
   budgets: [],
+  circuit_breaker: { ...DEFAULT_CIRCUIT_BREAKER },
+  pricing: [],
 }
 
 // Safe skeleton with placeholder (zero) values -- contains no real amounts,
@@ -85,6 +128,14 @@ const EXAMPLE_CONFIG = {
   ],
   budgets: [
     { id: 'global-monthly', name: 'Global monthly', scope: 'global', amount: 0, warning_threshold: 0.8, hard_threshold: 1.0 },
+  ],
+  circuit_breaker: {
+    currency: 'USD', daily_cap: 5, project_cap: 20, max_retries: 2, systematic_threshold: 2,
+  },
+  _pricing_doc: 'Per-model prices for deriving paid usage cost (providers do not return it). unit_price is per `unit` in `currency` (default USD). model="" is a provider-wide fallback; a longer model prefixing the requested one wins. Fill in current provider list prices -- verify before trusting, they drift. The two below are the documented anchors from store/governance-inputs/model-routing.json (2026-07).',
+  pricing: [
+    { provider: 'fal.ai', model: 'fal-ai/flux-pro/kontext', unit_price: 0.04, unit: 'image', currency: 'USD', notes: 'product-in-hand compose, model-routing.json 2026-07' },
+    { provider: 'fal.ai', model: '', unit_price: 0, unit: 'image', currency: 'USD', notes: 'provider-wide fallback -- set a real default or leave 0 to force explicit billed_cost' },
   ],
 }
 
@@ -173,9 +224,63 @@ export function validateConfig(raw: unknown): ConfigLoadResult {
     })
   }
 
+  const circuit_breaker = parseCircuitBreaker(obj.circuit_breaker, errors)
+  const pricing = parsePricing(obj.pricing, currency, errors)
+
   return {
-    config: { version: typeof obj.version === 'number' ? obj.version : 1, currency, fixed_costs, budgets },
+    config: { version: typeof obj.version === 'number' ? obj.version : 1, currency, fixed_costs, budgets, circuit_breaker, pricing },
     exists: true,
     errors,
+  }
+}
+
+// Parse the optional pricing table. A missing block yields []; an invalid entry
+// is dropped with an error note (never throws, never fabricates a price), so a
+// typo in one price can't take down the whole config or the summary endpoint.
+function parsePricing(raw: unknown, currency: string, errors: string[]): PriceEntry[] {
+  if (raw === undefined || raw === null) return []
+  if (!Array.isArray(raw)) { errors.push('pricing: must be an array'); return [] }
+  const out: PriceEntry[] = []
+  for (const [i, e] of raw.entries()) {
+    const c = e as Record<string, unknown>
+    if (typeof c?.provider !== 'string' || !c.provider.trim()) { errors.push(`pricing[${i}]: missing provider`); continue }
+    if (typeof c?.unit_price !== 'number' || !isFinite(c.unit_price) || c.unit_price < 0) { errors.push(`pricing[${i}] (${c.provider}): unit_price must be a non-negative number`); continue }
+    out.push({
+      provider: c.provider.trim(),
+      model: typeof c.model === 'string' ? c.model.trim() : '',
+      unit_price: c.unit_price,
+      unit: typeof c.unit === 'string' ? c.unit : 'call',
+      currency: typeof c.currency === 'string' ? c.currency : currency,
+      notes: typeof c.notes === 'string' ? c.notes : undefined,
+    })
+  }
+  return out
+}
+
+// Parse the optional circuit_breaker block. A missing block yields the defaults;
+// a present-but-invalid field falls back to its default with an error note, so a
+// typo can never silently disable the cap or throw.
+function parseCircuitBreaker(raw: unknown, errors: string[]): CircuitBreakerConfig {
+  if (raw === undefined || raw === null) return { ...DEFAULT_CIRCUIT_BREAKER }
+  if (typeof raw !== 'object') {
+    errors.push('circuit_breaker: must be an object')
+    return { ...DEFAULT_CIRCUIT_BREAKER }
+  }
+  const c = raw as Record<string, unknown>
+  const num = (key: keyof CircuitBreakerConfig, def: number): number => {
+    const v = c[key]
+    if (v === undefined) return def
+    if (typeof v !== 'number' || !isFinite(v) || v < 0) {
+      errors.push(`circuit_breaker.${key}: must be a non-negative number`)
+      return def
+    }
+    return v
+  }
+  return {
+    currency: typeof c.currency === 'string' && c.currency ? c.currency : DEFAULT_CIRCUIT_BREAKER.currency,
+    daily_cap: num('daily_cap', DEFAULT_CIRCUIT_BREAKER.daily_cap),
+    project_cap: num('project_cap', DEFAULT_CIRCUIT_BREAKER.project_cap),
+    max_retries: num('max_retries', DEFAULT_CIRCUIT_BREAKER.max_retries),
+    systematic_threshold: num('systematic_threshold', DEFAULT_CIRCUIT_BREAKER.systematic_threshold),
   }
 }

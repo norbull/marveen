@@ -178,6 +178,30 @@ export function initDatabase(dbPathOverride?: string): void {
     // column already exists
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_kanban_parent ON kanban_cards(parent_id)')
+  // Kanban <-> GitHub Projects v2 sync (deterministic, zero runtime LLM token).
+  // outbox: transactional forward-path queue -- the kanban writer functions
+  // enqueue a row IN THE SAME write so a crash between the DB write and the
+  // GraphQL push cannot lose a change; the sync loop drains + deletes on success.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS kanban_sync_outbox (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      card_id TEXT NOT NULL,
+      op TEXT NOT NULL CHECK(op IN ('upsert','delete')),
+      enqueued_at INTEGER NOT NULL
+    )
+  `)
+  // sync_state: per-card binding to the Project item + last-synced fingerprint,
+  // used for change detection (which side moved) and echo-loop avoidance.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS kanban_sync_state (
+      card_id TEXT PRIMARY KEY,
+      item_id TEXT,
+      last_synced_hash TEXT,
+      local_updated_at INTEGER,
+      remote_updated_at INTEGER,
+      synced_at INTEGER
+    )
+  `)
   // Migration: add dispatched_at to kanban_cards (kanban -> agent dispatch
   // once-only guard). Older installs created the table without it.
   try {
@@ -590,6 +614,28 @@ export function initDatabase(dbPathOverride?: string): void {
     )
   `)
 
+  // --- Channel Outbox (DEAD-only outbound safety net) ---
+  // A row is enqueued ONLY when an agent's channel plugin was DEAD at send
+  // time, so the reply tool could not have delivered the message (no dup risk).
+  // The drain flushes pending rows on the plugin's DEAD->HEALTHY edge, sending
+  // directly via the Bot API (plugin-independent). See src/channel-outbox.ts.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS channel_outbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'telegram',
+      chat_id TEXT NOT NULL,
+      text TEXT NOT NULL,
+      parse_mode TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','dropped')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      last_attempt_at INTEGER
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_channel_outbox_pending ON channel_outbox(status, agent_id, provider)`)
+
   // --- Idea Box ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS idea_box (
@@ -748,6 +794,24 @@ export function initDatabase(dbPathOverride?: string): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cost_line_items_period ON cost_line_items(charge_period_start, charge_period_end)`)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cost_line_items_source ON cost_line_items(source_id)`)
 
+  // --- Cost circuit-breaker: per-deliverable attempt/fail history ---
+  // Feeds the pure decision core in costops/circuit-breaker.ts (retry cap +
+  // systematic-fail classification). One row per generation attempt: fail_code
+  // NULL = success, otherwise one of the Iris QC fail-taxonomy codes. Provider-
+  // agnostic; budget aggregation reads cost_line_items, not this table.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS deliverable_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id TEXT NOT NULL,
+      deliverable TEXT NOT NULL,
+      attempt_no INTEGER NOT NULL,
+      fail_code TEXT,
+      created_at INTEGER NOT NULL
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_deliverable_attempts_deliverable ON deliverable_attempts(client_id, deliverable)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_deliverable_attempts_failcode ON deliverable_attempts(client_id, fail_code)`)
+
   // --- Vault SSH Keys (shared pool) ---
   db.exec(`
     CREATE TABLE IF NOT EXISTS vault_ssh_keys (
@@ -793,6 +857,26 @@ export function initDatabase(dbPathOverride?: string): void {
   try { db.exec('ALTER TABLE vault_ssh_servers DROP COLUMN key_expires_at') } catch { /* column absent or SQLite pre-3.35 */ }
   try { db.exec('ALTER TABLE vault_ssh_servers ADD COLUMN ssh_key_id TEXT REFERENCES vault_ssh_keys(id)') } catch { /* already exists */ }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_vault_ssh_servers_key ON vault_ssh_servers(ssh_key_id)`)
+
+  // --- Approvals (HITL) ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approvals (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      action_description TEXT NOT NULL,
+      action_payload TEXT,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','approved','rejected','timeout')),
+      timeout_at INTEGER,
+      telegram_message_id INTEGER,
+      requested_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      resolved_at INTEGER,
+      resolved_by TEXT
+    )
+  `)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, requested_at)`)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_approvals_agent ON approvals(agent_id, requested_at)`)
 
   // One-shot migration from the old JSON file (which had a read-modify-write
   // race). Import rows if they exist, then rename the file so we don't keep
@@ -1460,6 +1544,7 @@ export function createKanbanCard(card: {
     card.assignee ?? null, card.priority ?? 'normal',
     card.project ?? null, card.parent_id ?? null, card.due_date ?? null, sortOrder, now, now
   )
+  enqueueKanbanSync(card.id, 'upsert')
 }
 
 export function updateKanbanCard(id: string, fields: Partial<Omit<KanbanCard, 'id' | 'created_at'>>): boolean {
@@ -1467,14 +1552,28 @@ export function updateKanbanCard(id: string, fields: Partial<Omit<KanbanCard, 'i
   if (!card) return false
   const now = Math.floor(Date.now() / 1000)
   const f = { ...card, ...fields, updated_at: now }
-  return db.prepare(
+  const changed = db.prepare(
     `UPDATE kanban_cards SET title=?, description=?, status=?, assignee=?, priority=?, project=?, parent_id=?, due_date=?, sort_order=?, updated_at=?, archived_at=?
      WHERE id=?`
   ).run(f.title, f.description, f.status, f.assignee, f.priority, f.project, f.parent_id, f.due_date, f.sort_order, f.updated_at, f.archived_at, id).changes > 0
+  if (changed) enqueueKanbanSync(id, 'upsert')
+  return changed
 }
 
 export function getChildCards(parentId: string): KanbanCard[] {
   return db.prepare('SELECT * FROM kanban_cards WHERE parent_id = ? AND archived_at IS NULL ORDER BY sort_order ASC').all(parentId) as KanbanCard[]
+}
+
+// Cards assigned to `assignee` that transitioned to done after `sinceSec`
+// (updated_at is stored in whole seconds). Used by the context-clean runner to
+// fire a task-boundary clean when an agent finishes a card. archived_at IS NULL
+// keeps the auto-archival of old done cards from re-surfacing here.
+export function getRecentlyDoneCardsForAssignee(
+  assignee: string, sinceSec: number,
+): { id: string; updated_at: number }[] {
+  return db.prepare(
+    "SELECT id, updated_at FROM kanban_cards WHERE assignee = ? AND status = 'done' AND archived_at IS NULL AND updated_at > ? ORDER BY updated_at ASC"
+  ).all(assignee, sinceSec) as { id: string; updated_at: number }[]
 }
 
 export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrder: number, actor?: string): boolean {
@@ -1490,7 +1589,58 @@ export function moveKanbanCard(id: string, status: KanbanCard['status'], sortOrd
       'INSERT INTO kanban_card_events (card_id, from_status, to_status, actor, created_at) VALUES (?, ?, ?, ?, ?)'
     ).run(id, prev, status, actor ?? null, now)
   }
+  if (changed) enqueueKanbanSync(id, 'upsert')
   return changed
+}
+
+// Cards currently in_progress and assigned to `assignee`. Used by the stuck-agent
+// watcher to only judge an agent that is supposed to be actively working.
+export function getInProgressCardsForAssignee(assignee: string): { id: string; title: string }[] {
+  return db.prepare(
+    "SELECT id, title FROM kanban_cards WHERE assignee = ? AND status = 'in_progress' AND archived_at IS NULL"
+  ).all(assignee) as { id: string; title: string }[]
+}
+
+// The reserved label that marks a card as manually on-hold (Norbi's BLOKK
+// marker, applied with a reason comment). A blocked card must never be handed
+// to an agent automatically: the autonomous pickup + move-dispatch paths skip
+// it so the hold survives the 60s runner instead of being auto-assigned. The
+// audit/report views deliberately still SEE blocked cards -- only dispatch is
+// gated here, not visibility.
+export const BLOCK_LABEL_NAME = 'BLOKK'
+
+// True if `cardId` carries the reserved BLOCK label. Shared by every
+// dispatch-side guard so the "is this card on hold?" rule lives in one place.
+export function cardHasBlockLabel(cardId: string): boolean {
+  return db.prepare(
+    `SELECT 1 FROM kanban_card_labels kcl
+       JOIN labels l ON l.id = kcl.label_id
+      WHERE kcl.card_id = ? AND l.name = ?
+      LIMIT 1`
+  ).get(cardId, BLOCK_LABEL_NAME) !== undefined
+}
+
+// The single highest-priority, oldest not-yet-dispatched planned/waiting card
+// assigned to `assignee`, or null. Used by the autonomous task-pickup watcher.
+// dispatched_at IS NULL is the once-only guard: a card already handed to the
+// agent (even if the agent later parked it back to waiting) is never re-picked.
+// The NOT EXISTS clause excludes BLOCK-labelled cards so a manual hold is not
+// silently overridden by the runner (the durable STOP-protection fix; replaces
+// the old assignee-wipe workaround).
+export function getNextPickableCardForAssignee(assignee: string): KanbanCard | null {
+  return (db.prepare(
+    `SELECT * FROM kanban_cards kc
+       WHERE kc.assignee = ? AND kc.status IN ('planned','waiting')
+         AND kc.dispatched_at IS NULL AND kc.archived_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM kanban_card_labels kcl
+             JOIN labels l ON l.id = kcl.label_id
+            WHERE kcl.card_id = kc.id AND l.name = ?
+         )
+       ORDER BY CASE kc.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END ASC,
+                kc.created_at ASC
+       LIMIT 1`
+  ).get(assignee, BLOCK_LABEL_NAME) as KanbanCard | undefined) ?? null
 }
 
 // Stamp the once-only kanban -> agent dispatch guard. Returns false if the
@@ -1502,12 +1652,18 @@ export function markKanbanCardDispatched(id: string): boolean {
 
 export function archiveKanbanCard(id: string): boolean {
   const now = Math.floor(Date.now() / 1000)
-  return db.prepare('UPDATE kanban_cards SET archived_at=?, updated_at=? WHERE id=?').run(now, now, id).changes > 0
+  const changed = db.prepare('UPDATE kanban_cards SET archived_at=?, updated_at=? WHERE id=?').run(now, now, id).changes > 0
+  // Archive crosses to GitHub as a delete of the Project item (decision #2:
+  // archive, never hard-delete on either side).
+  if (changed) enqueueKanbanSync(id, 'delete')
+  return changed
 }
 
 export function unarchiveKanbanCard(id: string): boolean {
   const now = Math.floor(Date.now() / 1000)
-  return db.prepare('UPDATE kanban_cards SET archived_at=NULL, updated_at=? WHERE id=? AND archived_at IS NOT NULL').run(now, id).changes > 0
+  const changed = db.prepare('UPDATE kanban_cards SET archived_at=NULL, updated_at=? WHERE id=? AND archived_at IS NOT NULL').run(now, id).changes > 0
+  if (changed) enqueueKanbanSync(id, 'upsert')
+  return changed
 }
 
 export interface ArchivedKanbanCard {
@@ -1581,8 +1737,95 @@ export function deleteKanbanCard(id: string): boolean {
     db.prepare('DELETE FROM kanban_comments WHERE card_id = ?').run(cardId)
     db.prepare('DELETE FROM kanban_card_labels WHERE card_id = ?').run(cardId)
     db.prepare('UPDATE kanban_cards SET parent_id = NULL WHERE parent_id = ?').run(cardId)
-    return db.prepare('DELETE FROM kanban_cards WHERE id = ?').run(cardId).changes > 0
+    const gone = db.prepare('DELETE FROM kanban_cards WHERE id = ?').run(cardId).changes > 0
+    // Enqueue inside the same transaction so the delete intent can never be
+    // lost (transactional outbox). No-op under the backward-write suppress flag.
+    if (gone) enqueueKanbanSync(cardId, 'delete')
+    return gone
   })(id) as boolean
+}
+
+// --- Kanban <-> GitHub Projects v2 sync: forward-path outbox + sync state ---
+// All deterministic SQLite helpers; the GraphQL side lives in
+// kanban-projects-sync.ts. Zero LLM, zero network here.
+
+export interface KanbanSyncOutboxRow { seq: number; card_id: string; op: 'upsert' | 'delete'; enqueued_at: number }
+export interface KanbanSyncState {
+  card_id: string
+  item_id: string | null
+  last_synced_hash: string | null
+  local_updated_at: number | null
+  remote_updated_at: number | null
+  synced_at: number | null
+}
+
+// Echo-loop guard: while applying a Projects -> SQLite write (backward path),
+// the kanban writer functions must NOT enqueue an outbox row, otherwise the
+// change would bounce straight back to GitHub. The backward path sets this
+// around its updateKanbanCard call. Node is single-threaded so a plain module
+// flag is race-free (mirrors store-watcher's setStoreWriteActor).
+let kanbanSyncSuppressed = false
+export function setKanbanSyncSuppressed(v: boolean): void { kanbanSyncSuppressed = v }
+
+// Enqueue a forward-sync intent. No-op when suppressed (backward write in
+// progress). Called by the kanban writer functions right after their write.
+export function enqueueKanbanSync(cardId: string, op: 'upsert' | 'delete'): void {
+  if (kanbanSyncSuppressed) return
+  db.prepare('INSERT INTO kanban_sync_outbox (card_id, op, enqueued_at) VALUES (?, ?, ?)')
+    .run(cardId, op, Math.floor(Date.now() / 1000))
+}
+
+export function drainKanbanOutbox(limit = 100): KanbanSyncOutboxRow[] {
+  return db.prepare('SELECT seq, card_id, op, enqueued_at FROM kanban_sync_outbox ORDER BY seq ASC LIMIT ?')
+    .all(limit) as KanbanSyncOutboxRow[]
+}
+
+export function deleteKanbanOutboxRow(seq: number): void {
+  db.prepare('DELETE FROM kanban_sync_outbox WHERE seq = ?').run(seq)
+}
+
+export function backfillKanbanSyncOutbox(): number {
+  const now = Math.floor(Date.now() / 1000)
+  return db.transaction(() => {
+    // Boot-time reconcile for cards created before the transactional outbox
+    // existed. Skip anything already mapped or already queued so restarts stay
+    // idempotent and the normal forward drain remains the only GitHub writer.
+    return db.prepare(
+      `INSERT INTO kanban_sync_outbox (card_id, op, enqueued_at)
+       SELECT c.id, 'upsert', ?
+       FROM kanban_cards c
+       LEFT JOIN kanban_sync_state s ON s.card_id = c.id
+       WHERE c.archived_at IS NULL
+         AND s.card_id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM kanban_sync_outbox o WHERE o.card_id = c.id
+         )
+       ORDER BY c.sort_order ASC, c.created_at ASC, c.id ASC`
+    ).run(now).changes
+  })() as number
+}
+
+export function getKanbanSyncState(cardId: string): KanbanSyncState | null {
+  return (db.prepare('SELECT * FROM kanban_sync_state WHERE card_id = ?').get(cardId) as KanbanSyncState | undefined) ?? null
+}
+
+export function listKanbanSyncStates(): KanbanSyncState[] {
+  return db.prepare('SELECT * FROM kanban_sync_state').all() as KanbanSyncState[]
+}
+
+export function upsertKanbanSyncState(s: KanbanSyncState): void {
+  db.prepare(
+    `INSERT INTO kanban_sync_state (card_id, item_id, last_synced_hash, local_updated_at, remote_updated_at, synced_at)
+     VALUES (@card_id, @item_id, @last_synced_hash, @local_updated_at, @remote_updated_at, @synced_at)
+     ON CONFLICT(card_id) DO UPDATE SET
+       item_id=excluded.item_id, last_synced_hash=excluded.last_synced_hash,
+       local_updated_at=excluded.local_updated_at, remote_updated_at=excluded.remote_updated_at,
+       synced_at=excluded.synced_at`
+  ).run(s)
+}
+
+export function deleteKanbanSyncState(cardId: string): void {
+  db.prepare('DELETE FROM kanban_sync_state WHERE card_id = ?').run(cardId)
 }
 
 export function getKanbanComments(cardId: string): KanbanComment[] {
@@ -1746,6 +1989,76 @@ export interface AgentMessage {
   // sub-agent's own task/branch name) -- NOT an authentication mechanism,
   // see the table-creation comment. Null for every caller that doesn't pass one.
   origin_note: string | null
+}
+
+// --- Channel Outbox (DEAD-only outbound safety net; see src/channel-outbox.ts) ---
+export interface ChannelOutboxRow {
+  id: number
+  agent_id: string
+  provider: string
+  chat_id: string
+  text: string
+  parse_mode: string | null
+  status: 'pending' | 'sent' | 'dropped'
+  attempts: number
+  last_error: string | null
+  created_at: number
+  last_attempt_at: number | null
+}
+
+/**
+ * Enqueue a Norbi-bound reply that could NOT be delivered because the agent's
+ * channel plugin was DEAD at send time. Only DEAD-time messages land here, so a
+ * later flush cannot duplicate a message the reply tool already delivered.
+ */
+export function enqueueChannelOutbox(
+  agentId: string, provider: string, chatId: string, text: string, parseMode: string | null,
+): ChannelOutboxRow {
+  const now = Math.floor(Date.now() / 1000)
+  const info = db.prepare(
+    `INSERT INTO channel_outbox (agent_id, provider, chat_id, text, parse_mode, status, attempts, created_at)
+     VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)`
+  ).run(agentId, provider, chatId, text, parseMode, now)
+  return {
+    id: Number(info.lastInsertRowid),
+    agent_id: agentId, provider, chat_id: chatId, text, parse_mode: parseMode,
+    status: 'pending', attempts: 0, last_error: null, created_at: now, last_attempt_at: null,
+  }
+}
+
+/** Pending rows for one agent+provider, oldest first (flush order). */
+export function listPendingChannelOutbox(agentId: string, provider: string): ChannelOutboxRow[] {
+  return db.prepare(
+    `SELECT * FROM channel_outbox WHERE status = 'pending' AND agent_id = ? AND provider = ? ORDER BY created_at ASC`
+  ).all(agentId, provider) as ChannelOutboxRow[]
+}
+
+/** Distinct agent+provider pairs that currently have pending rows. */
+export function pendingChannelOutboxAgents(): { agent_id: string; provider: string }[] {
+  return db.prepare(
+    `SELECT DISTINCT agent_id, provider FROM channel_outbox WHERE status = 'pending'`
+  ).all() as { agent_id: string; provider: string }[]
+}
+
+export function markChannelOutboxSent(id: number): void {
+  db.prepare(
+    `UPDATE channel_outbox SET status = 'sent', last_attempt_at = ? WHERE id = ?`
+  ).run(Math.floor(Date.now() / 1000), id)
+}
+
+export function bumpChannelOutboxAttempt(id: number, error: string): number {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(
+    `UPDATE channel_outbox SET attempts = attempts + 1, last_error = ?, last_attempt_at = ? WHERE id = ?`
+  ).run(error.slice(0, 500), now, id)
+  const row = db.prepare(`SELECT attempts FROM channel_outbox WHERE id = ?`).get(id) as { attempts: number } | undefined
+  return row?.attempts ?? 0
+}
+
+export function markChannelOutboxDropped(id: number, error: string): void {
+  db.prepare(
+    `UPDATE channel_outbox SET status = 'dropped', last_error = ?, last_attempt_at = ? WHERE id = ?`
+  ).run(error.slice(0, 500), Math.floor(Date.now() / 1000), id)
 }
 
 export function createAgentMessage(from: string, to: string, content: string, originNote?: string | null): AgentMessage {
@@ -2819,5 +3132,96 @@ export function updateVaultSshServer(id: string, patch: Partial<Pick<VaultSshSer
 
 export function deleteVaultSshServer(id: string): boolean {
   return db.prepare('DELETE FROM vault_ssh_servers WHERE id = ?').run(id).changes > 0
+}
+
+// --- Approvals (HITL) ---
+
+export interface Approval {
+  id: string
+  agent_id: string
+  category: string
+  action_description: string
+  action_payload: string | null
+  status: 'pending' | 'approved' | 'rejected' | 'timeout'
+  timeout_at: number | null
+  telegram_message_id: number | null
+  requested_at: number
+  resolved_at: number | null
+  resolved_by: string | null
+}
+
+export function createApproval(params: {
+  id: string
+  agent_id: string
+  category: string
+  action_description: string
+  action_payload?: string | null
+  timeout_at?: number | null
+}): Approval {
+  const now = Math.floor(Date.now() / 1000)
+  db.prepare(`
+    INSERT INTO approvals (id, agent_id, category, action_description, action_payload, timeout_at, requested_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    params.id,
+    params.agent_id,
+    params.category,
+    params.action_description,
+    params.action_payload ?? null,
+    params.timeout_at ?? null,
+    now,
+  )
+  return {
+    id: params.id,
+    agent_id: params.agent_id,
+    category: params.category,
+    action_description: params.action_description,
+    action_payload: params.action_payload ?? null,
+    status: 'pending',
+    timeout_at: params.timeout_at ?? null,
+    telegram_message_id: null,
+    requested_at: now,
+    resolved_at: null,
+    resolved_by: null,
+  }
+}
+
+export function getApproval(id: string): Approval | undefined {
+  return db.prepare('SELECT * FROM approvals WHERE id = ?').get(id) as Approval | undefined
+}
+
+export function resolveApproval(id: string, status: 'approved' | 'rejected' | 'timeout', resolvedBy: string, telegramMessageId?: number | null): boolean {
+  const now = Math.floor(Date.now() / 1000)
+  return db.prepare(`
+    UPDATE approvals
+    SET status = ?, resolved_at = ?, resolved_by = ?,
+        telegram_message_id = COALESCE(?, telegram_message_id)
+    WHERE id = ? AND status = 'pending'
+  `).run(status, now, resolvedBy, telegramMessageId ?? null, id).changes > 0
+}
+
+export function listApprovals(opts: {
+  agent_id?: string
+  category?: string
+  status?: string
+  limit?: number
+}): Approval[] {
+  const conditions: string[] = []
+  const params: unknown[] = []
+  if (opts.agent_id) { conditions.push('agent_id = ?'); params.push(opts.agent_id) }
+  if (opts.category) { conditions.push('category = ?'); params.push(opts.category) }
+  if (opts.status) { conditions.push('status = ?'); params.push(opts.status) }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+  const limit = Math.min(opts.limit ?? 100, 500)
+  params.push(limit)
+  return db.prepare(`SELECT * FROM approvals ${where} ORDER BY requested_at DESC LIMIT ?`).all(...params) as Approval[]
+}
+
+export function expireTimedOutApprovals(): number {
+  const now = Math.floor(Date.now() / 1000)
+  return db.prepare(`
+    UPDATE approvals SET status = 'timeout', resolved_at = ?
+    WHERE status = 'pending' AND timeout_at IS NOT NULL AND timeout_at <= ?
+  `).run(now, now).changes
 }
 

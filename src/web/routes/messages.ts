@@ -8,6 +8,7 @@ import {
 import { logger } from '../../logger.js'
 import { COORDINATOR_AGENT_ID } from '../../channel-coordinator/ingest.js'
 import { sanitizeAgentIdent } from '../../prompt-safety.js'
+import { isKnownAgent } from '../agent-config.js'
 import { readBody, json } from '../http-helpers.js'
 import { normalizeKanbanRefs } from '../kanban-ref-normalize.js'
 import { parseQualifiedId, formatQualifiedId } from '../federation/address.js'
@@ -19,8 +20,19 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
 
   if (path === '/api/messages' && method === 'POST') {
     const body = await readBody(req)
-    const { from, to, content, origin_note } = JSON.parse(body.toString()) as
-      { from: string; to: string; content: string; origin_note?: string }
+    // Guard the parse: a malformed JSON body (e.g. an unescaped quote/newline
+    // in a curl-inline payload) previously threw out of the handler, surfaced
+    // as a generic 500 "Web szerver hiba", and silently dropped the message.
+    // Reject it as a clean 400 so the caller sees the failure and can retry.
+    let parsed: { from?: string; to?: string; content?: string; origin_note?: string }
+    try {
+      parsed = JSON.parse(body.toString())
+    } catch {
+      logger.warn({ path }, 'Rejected /api/messages POST with malformed JSON body')
+      json(res, { error: 'malformed JSON body' }, 400)
+      return true
+    }
+    const { from, to, content, origin_note } = parsed
     if (!from?.trim() || !to?.trim() || !content?.trim()) {
       json(res, { error: 'from, to, and content are required' }, 400)
       return true
@@ -53,6 +65,19 @@ export async function tryHandleMessages(ctx: RouteContext): Promise<boolean> {
     if (from.includes('/')) {
       logger.warn({ from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST with qualified from (federation impersonation guard)')
       json(res, { error: 'from must be a local agent id without "/" -- federated senders are only accepted via /api/federation/inbox' }, 403)
+      return true
+    }
+    // From-authentication: accept messages only from registered fleet agents.
+    // The shared Bearer token is readable by any sub-agent, so without this
+    // check any process with the token could inject messages as an arbitrary
+    // sender ("from": "zack" from an external attacker who obtained the token).
+    // Server-side validation: the `from` claim must match a known agent on the
+    // filesystem (agents/<id>/ directory, or MAIN_AGENT_ID). This is not
+    // impersonation-proof between fleet agents (they share the same token) but
+    // it closes the "unknown sender" injection path without per-agent secrets.
+    if (!isKnownAgent(sanitizeAgentIdent(from))) {
+      logger.warn({ from: from.trim(), to: to.trim() }, 'Rejected /api/messages POST from unregistered agent')
+      json(res, { error: `unknown agent '${from.trim()}' -- from must be a registered fleet agent id` }, 403)
       return true
     }
     // Qualified to ("peer/agent"): validate at creation time so the sender

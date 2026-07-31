@@ -21,10 +21,13 @@
 
 export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 
-// Claude Code shows the footer in one of two modes: the default "bypass"
-// permissions mode (permissive) and the "strict" mode. Both are "idle"
-// surfaces. If neither is visible the pane is not a recognised Claude
-// Code surface and we report 'unknown' rather than guess.
+// Claude Code shows the footer in one of two permission modes: the
+// default "bypass" permissions mode (permissive, launched with
+// --dangerously-skip-permissions) and the "strict" mode (a sub-agent on
+// a strict security profile -- researcher / developer-junior / marketer --
+// launched WITHOUT that flag so the native allow/deny engine governs).
+// Both are "idle" surfaces. If neither is visible the pane is not a
+// recognised Claude Code surface and we report 'unknown' rather than guess.
 //
 // The bypass-mode footer has known trailing variants after the
 // "bypass permissions on" prefix: the original "(shift+tab to cycle)"
@@ -47,17 +50,20 @@ export type PaneState = 'idle' | 'busy' | 'typing' | 'unknown' | 'error'
 //       happens to contain "bypass permissions on · 1 shell" verbatim
 //       (an echoed log line, a quoted message, etc.) which would
 //       otherwise be misread as idle.
-// The idle footer's trailing action area is highly variable: `(shift+tab to
-// cycle)`, or `· N shells · ctrl+t`, or -- when a background monitor and/or
-// sub-agents are present -- `· N monitor · ← for agents · ↓ to manage`. The
-// previous regex only accepted the `· \d+ shells ·` shape, so a session running
-// a background monitor (footer `· 1 monitor · ← for agents · ↓ to manage`) was
-// mis-read as 'unknown' and the router/scheduler silently refused to deliver to
-// it -- a fleet-wide delivery hole. Match `bypass permissions on` + EITHER the
-// shift+tab hint OR any `·`-separated tail ending in a known idle action (ctrl+t
-// / ↓ to manage). Busy states are filtered above (esc to interrupt / busy
-// indicators / paste placeholder), so this stays idle-specific.
-const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage))|\? for shortcuts/
+//
+// Two arms merged here (upstream #458 generalisation + our strict-profile arm):
+// (a) upstream generalised the trailing action area to ANY `·`-separated tail
+//     ending in a known idle action (ctrl+t / ↓ to manage), covering footers
+//     like `· N monitor · ← for agents · ↓ to manage` that the old `· \d+
+//     shells ·` shape mis-read as 'unknown' -- a fleet-wide delivery hole;
+// (b) the strict-mode footer has NO "bypass permissions on" prefix (that string
+//     is exclusive to the skip-permissions launch). Its right edge shows the
+//     fixed `← for agents` idle hint (a live turn replaces it with `esc to
+//     interrupt`). Without arm (b) a strict-profile sub-agent's footer
+//     (`gh auth login · ← for agents`) read as 'unknown' and inter-agent
+//     messages to it stuck pending forever. NBSP/variable-space tolerated via
+//     `[^\S\r\n]+`, as in PARKED_INPUT_RX.
+const IDLE_FOOTER_RX = /bypass permissions on(?: \(shift\+tab to cycle\)| · [^\n]*?(?:ctrl\+t|↓ to manage))|\? for shortcuts|←[^\S\r\n]+for agents/
 
 // Positive busy signals. ANY match anywhere in the pane means the turn
 // is mid-flight, even if the footer looks idle for a frame.

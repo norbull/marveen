@@ -4,6 +4,38 @@
   },
   "effortLevel": "high",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{PROJECT_ROOT}}/scripts/hooks/permission-router.py",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|send_email",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node {{PROJECT_ROOT}}/scripts/email-send-gate.mjs",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "ScheduleWakeup|CronCreate|CronDelete|CronList|RemoteTrigger|Bash|Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node {{PROJECT_ROOT}}/scripts/self-pace-gate.mjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "matcher": "auto",
@@ -35,6 +67,11 @@
             "type": "command",
             "command": "bash -c '[ -f {{PROJECT_ROOT}}/scripts/hooks/staleness-guard.py ] && exec python3 {{PROJECT_ROOT}}/scripts/hooks/staleness-guard.py; exit 0'",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash -c '[ -f {{PROJECT_ROOT}}/scripts/hooks/channel-inbox-drain.py ] && exec python3 {{PROJECT_ROOT}}/scripts/hooks/channel-inbox-drain.py; exit 0'",
+            "timeout": 5
           },
           {
             "type": "command",

@@ -82,6 +82,10 @@ const WRITE_INTENT_RX = /(>>?|\btee\b|\bsed\b[\s\S]*\s-i|\bdd\b|\bcp\b|\bmv\b)/i
 // self-paced cron; a GET (list / pending / agents) is legit diagnostics -> allowed.
 const SCHEDULE_API_RX = /\/api\/schedules\b/i
 const HTTP_WRITE_RX = /(-X\s*(POST|PUT|PATCH|DELETE)|--request\s+(POST|PUT|PATCH|DELETE)|(^|\s)(--data\b|--data-\w+\b|-d\b))/i
+const OWN_API_RX = /\bcurl\b[\s\S]*\bhttps?:\/\/(?:localhost|127\.0\.0\.1):3420\/api\//i
+const DATA_STDIN_RX = /(?:^|\s)(?:-d|--data(?:-(?:raw|binary|ascii|urlencode))?)(?:\s+|=)@-(?=$|\s)/i
+const GIT_COMMIT_MSG_HEREDOC_RX = /\bgit\s+commit\b[\s\S]*\s-m\s+"\$\(\s*cat\s+<<-?\s*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1/i
+const HEREDOC_BODY_RX = /(<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2[^\r\n]*)(\r?\n)([\s\S]*?)(\r?\n)(\3)(?=\r?\n|\s*$|\s*[;&|])/g
 
 // Split a compound command into individual simple commands, so a token in one
 // segment cannot trip a check anchored in another (e.g. `cat store && cp a b`).
@@ -142,6 +146,24 @@ export function stripDataPayloads(seg) {
   )
 }
 
+// Blank heredoc BODIES only for known prose carriers. A heredoc fed to bash,
+// python, ssh, etc. is executable input and must stay visible to the matchers;
+// but dashboard API stdin payloads and git commit messages are text containers
+// that may legitimately discuss self-pace vectors as topics.
+export function stripKnownProseHeredocs(command) {
+  const raw = String(command ?? '')
+  let commandStart = 0
+  return raw.replace(HEREDOC_BODY_RX, (full, opener, _quote, _tag, lineBreak, _body, _preTerm, term, offset) => {
+    const bodyStart = offset + opener.length + lineBreak.length
+    const skeleton = raw.slice(commandStart, bodyStart)
+    const isOwnApiStdinPayload = OWN_API_RX.test(skeleton) && DATA_STDIN_RX.test(skeleton)
+    const isGitCommitMessage = GIT_COMMIT_MSG_HEREDOC_RX.test(skeleton)
+    commandStart = offset + full.length
+    if (!isOwnApiStdinPayload && !isGitCommitMessage) return full
+    return opener + lineBreak + term
+  })
+}
+
 // Blank out git commit/tag/stash -m/--message LITERAL text before self-pace
 // matching. A commit message is prose, NEVER a shell invocation, so a trigger
 // token that only appears INSIDE the message must not false-deny (2026-07-13,
@@ -175,14 +197,17 @@ export function gateDecision(toolName, toolInput) {
     if (SCHEDULE_STORE_RX.test(fp)) return { deny: true }
   }
   if (name === 'Bash') {
-    // Strip -d/--data payloads on the WHOLE command BEFORE splitting. A payload is
-    // data, not an invocation; and since splitSegments is NOT quote-aware, a shell
-    // separator (; && | &) INSIDE a dispatch body would otherwise orphan a fragment
-    // that false-matches. Stripping first blanks the body (incl. any separators in
-    // it), so the URL/method args still match but the body text never does. A
-    // separator OUTSIDE the payload still splits, so `curl -d '' x ; crontab -r`
-    // is still caught.
-    const safeCommand = stripDataPayloads(stripGitCommitMessages(String(toolInput?.command ?? '')))
+    // Strip literal git commit/tag/stash -m messages, -d/--data payloads and known
+    // prose heredoc bodies on the WHOLE command BEFORE splitting. Each is data/prose,
+    // not an invocation; and since splitSegments is NOT quote-aware, a shell separator
+    // (; && | &) INSIDE such a body would otherwise orphan a fragment that false-matches.
+    // Stripping first blanks the body (incl. any separators in it), so the URL/method
+    // args still match but the body text never does. A separator OUTSIDE the payload
+    // still splits, so `curl -d '' x ; crontab -r` is still caught. The three strips
+    // target disjoint regions (-m message / -d payload / prose heredoc body).
+    const safeCommand = stripKnownProseHeredocs(
+      stripDataPayloads(stripGitCommitMessages(String(toolInput?.command ?? ''))),
+    )
     // Per-segment so an unrelated token elsewhere in a compound command cannot
     // turn a legit read (store inspection, schedule-API GET) into a false deny.
     for (const seg of splitSegments(safeCommand)) {

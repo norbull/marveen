@@ -472,6 +472,33 @@ if [ -x "$INSTALL_DIR/scripts/sync-hooks.sh" ]; then
   bash "$INSTALL_DIR/scripts/sync-hooks.sh" || echo -e "  FIGYELEM: sync-hooks.sh nem-nulla exit; manualisan ellenorizd."
 fi
 
+# Ops-hook self-heal (kanban #106): ha az update checkout-ja kiutotte valamelyik
+# kritikus fork-only hookot, allitsuk vissza developbol MOST, ne varjunk a
+# periodikus timerre. Idempotens; ep fajlokhoz nem nyul.
+if [ -x "$INSTALL_DIR/scripts/ops-hook-selfheal.sh" ]; then
+  echo -e "  Ops-hook self-heal ellenorzes..."
+  bash "$INSTALL_DIR/scripts/ops-hook-selfheal.sh" || echo -e "  FIGYELEM: ops-hook-selfheal nem-nulla exit."
+fi
+
+# Plugin patch-ek ujra-alkalmazasa frissites utan (idempotens).
+if [ -d "$INSTALL_DIR/scripts/patches" ]; then
+  for patch in "$INSTALL_DIR/scripts/patches"/*.sh; do
+    [ -x "$patch" ] || continue
+    echo -e "  Patch: $(basename "$patch")..."
+    bash "$patch" || echo -e "  FIGYELEM: $(basename "$patch") nem-nulla exit."
+  done
+fi
+
+# Graphify tudasgraf regeneralasa (best-effort). A web/icons/graphify-graph.html
+# gitignore-olt runtime artifact, ezert friss checkout utan hianyzik -> a dashboard
+# Graphify panelje 404-ezne. Ez a script ujraepiti a friss src/-bol (tree-sitter
+# AST + lokalis ollama nevadas, nulla API-koltseg); graphify/ollama hianyaban
+# gracefully kilep, a deployt nem tori.
+if [ -x "$INSTALL_DIR/scripts/regen-graphify.sh" ]; then
+  echo -e "  Graphify graf frissitese (hatterben)..."
+  setsid bash "$INSTALL_DIR/scripts/regen-graphify.sh" </dev/null >>"$INSTALL_DIR/store/regen-graphify.log" 2>&1 &
+fi
+
 # Seed skills & scheduled tasks (idempotent: skip existing)
 # Source .env for template variables needed by seed-scheduled-tasks
 MAIN_AGENT_ID=""

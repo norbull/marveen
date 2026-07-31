@@ -1534,6 +1534,9 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           // the --channels plugin MCP server, so the agent comes up with no plugin
           // and no poller (verified: continue -> "Plugin not found" in /mcp; fresh
           // -> plugin loads + poller attaches). Context is dropped, memory persists.
+          // NB: our earlier skipIdentitySetup arm assumed --continue preserved the
+          // agent's identity from context; it does NOT apply to a fresh boot, which
+          // has no conversation context and must run identity-setup normally.
           startAgentProcess(t.agentName!, { fresh: true })
           agentLastRestart.set(t.agentName!, Date.now())
           agentDownSince.delete(t.session)

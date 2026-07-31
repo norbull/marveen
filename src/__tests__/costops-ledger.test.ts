@@ -6,6 +6,7 @@ import {
   confidenceBucket,
   syncFixedCostsToLedger,
   getCostSummary,
+  recordUsage,
 } from '../costops/ledger.js'
 import { validateConfig } from '../costops/config.js'
 import type { CostOpsConfig } from '../costops/config.js'
@@ -200,5 +201,75 @@ describe('costops ledger + summary', () => {
     expect(s.token_usage.note).toContain('not priced')
     // token usage must NOT contribute to money
     expect(s.current_spend).toBe(0)
+  })
+})
+
+describe('recordUsage (per-event paid-usage write path)', () => {
+  beforeEach(() => { initDatabase(':memory:') })
+
+  function spend(): number {
+    return getCostSummary(getDb(), cfg({ fixed_costs: [] }), NOW).current_spend
+  }
+
+  it('records a charge, creates a per-provider usage source, and it shows in spend', () => {
+    const db = getDb()
+    const r = recordUsage(db, { provider: 'fal.ai', billed_cost: 12, service_name: 'flux-pro', occurred_at: NOW }, NOW)
+    expect(r.source_id).toBe('usage:fal.ai')
+    expect(r.deduped).toBe(false)
+    const src = db.prepare("SELECT provider, source_type FROM cost_sources WHERE id = 'usage:fal.ai'").get() as any
+    expect(src.provider).toBe('fal.ai')
+    expect(src.source_type).toBe('usage')
+    expect(spend()).toBe(12)
+  })
+
+  it('is idempotent on ref: re-posting the same ref updates in place, never double-counts', () => {
+    const db = getDb()
+    const first = recordUsage(db, { provider: 'fal.ai', billed_cost: 12, ref: 'gen-abc', occurred_at: NOW }, NOW)
+    expect(first.deduped).toBe(false)
+    const again = recordUsage(db, { provider: 'fal.ai', billed_cost: 12, ref: 'gen-abc', occurred_at: NOW }, NOW)
+    expect(again.deduped).toBe(true)
+    expect(again.dedup_key).toBe(first.dedup_key)
+    const rows = db.prepare("SELECT COUNT(*) c FROM cost_line_items WHERE dedup_key = ?").get(first.dedup_key) as any
+    expect(rows.c).toBe(1)
+    expect(spend()).toBe(12) // not 24
+  })
+
+  it('distinct refs are distinct charges', () => {
+    const db = getDb()
+    recordUsage(db, { provider: 'fal.ai', billed_cost: 10, ref: 'g1', occurred_at: NOW }, NOW)
+    recordUsage(db, { provider: 'fal.ai', billed_cost: 7, ref: 'g2', occurred_at: NOW }, NOW)
+    expect(spend()).toBe(17)
+  })
+
+  it('is provider-agnostic: spend from different providers sums into one common total', () => {
+    const db = getDb()
+    recordUsage(db, { provider: 'fal.ai', billed_cost: 10, ref: 'f1', occurred_at: NOW }, NOW)
+    recordUsage(db, { provider: 'openrouter', billed_cost: 3, ref: 'o1', occurred_at: NOW }, NOW)
+    recordUsage(db, { provider: 'kling', billed_cost: 20, ref: 'k1', occurred_at: NOW }, NOW)
+    expect(spend()).toBe(33)
+  })
+
+  it('stores agent/project/deliverable attribution as JSON in source_ref', () => {
+    const db = getDb()
+    const r = recordUsage(db, {
+      provider: 'fal.ai', billed_cost: 5, ref: 'g9', occurred_at: NOW,
+      agent: 'iris', project: 'ZOE', deliverable: 'poster',
+    }, NOW)
+    const row = db.prepare("SELECT source_ref FROM cost_line_items WHERE dedup_key = ?").get(r.dedup_key) as any
+    const attr = JSON.parse(row.source_ref)
+    expect(attr).toMatchObject({ agent: 'iris', project: 'ZOE', deliverable: 'poster', ref: 'g9' })
+  })
+
+  it('rejects missing provider and negative cost', () => {
+    const db = getDb()
+    expect(() => recordUsage(db, { provider: '', billed_cost: 5 }, NOW)).toThrow(/provider/)
+    expect(() => recordUsage(db, { provider: 'fal.ai', billed_cost: -1 }, NOW)).toThrow(/billed_cost/)
+  })
+
+  it('a charge dated outside the summary month is excluded from that month spend', () => {
+    const db = getDb()
+    const w = monthWindow(NOW)
+    recordUsage(db, { provider: 'fal.ai', billed_cost: 99, ref: 'next', occurred_at: w.end + 100 }, NOW)
+    expect(spend()).toBe(0)
   })
 })
