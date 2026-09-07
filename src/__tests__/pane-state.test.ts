@@ -73,6 +73,41 @@ const BUSY_TOKENS_ONLY = [
   '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
 ].join('\n')
 
+// MINUTE-SCALE TURNS. Measured 2026-09-07 11:00 on the live dex pane: every
+// fixture above is seconds-only (4s, 8s, 12s, 52s), so the seconds-only
+// pattern `\(\s*\d+s` passed every test while silently failing the moment a
+// turn crossed sixty seconds. dex was 3m 49s into a live turn and this
+// module answered 'idle'; acting on that would have interrupted a running
+// tool call. These three fixtures are the direction the suite never proved.
+const BUSY_MINUTES_KNOWN_LABEL = [
+  '· Pondering… (3m 8s · ↓ 9.3k tokens)',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+// The label is a gerund nobody listed. Only the bare token-counter pattern
+// can catch this one, which is why THAT pattern must carry the minute form.
+const BUSY_MINUTES_UNKNOWN_LABEL = [
+  '✻ Lollygagging… (3m 49s · ↓ 16.0k tokens)',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
+const BUSY_MINUTES_HIGH_EFFORT = [
+  '✽ Pondering… (12m 3s · ↓ 30.8k tokens · thinking with high effort)',
+  '',
+  SEP,
+  '❯ ',
+  SEP,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n')
+
 // Tool-use summary lines persist in the scrollback AFTER a turn ends --
 // Claude Code does not overwrite them. Including them as busy signals
 // would classify an otherwise idle agent as busy forever, starving
@@ -460,6 +495,11 @@ describe('detectPaneState', () => {
     // A Claude Code release could rename "Combobulating" to anything. The
     // (Ns · ↓N tokens) pattern is the load-bearing fallback.
     expect(detectPaneState(BUSY_TOKENS_ONLY)).toBe('busy')
+    // Minute-scale turns (measured false-idle, 2026-09-07): a turn does not
+    // stop being live when it passes a minute.
+    expect(detectPaneState(BUSY_MINUTES_KNOWN_LABEL)).toBe('busy')
+    expect(detectPaneState(BUSY_MINUTES_UNKNOWN_LABEL)).toBe('busy')
+    expect(detectPaneState(BUSY_MINUTES_HIGH_EFFORT)).toBe('busy')
   })
 
   it('detects busy when a tool-use summary is paired with a live spinner', () => {

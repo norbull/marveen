@@ -102,13 +102,28 @@ const BUSY_INDICATORS: RegExp[] = [
   // 2026-06-30). The live spinner/token line renders just above the input
   // box during a real turn, so the bottom-region scope still catches it.
   //
-  // Tokens-down-arrow counter: "(52s · ↓ 2.6k tokens ..."
-  /\(\s*\d+s\s*·\s*↓\s*\d/,
+  // Tokens-down-arrow counter: "(52s · ↓ 2.6k tokens ..." AND the
+  // minute-scale form "(3m 49s · ↓ 16.0k tokens ...".
+  //
+  // MEASURED 2026-09-07 11:00: the seconds-only shape `\(\s*\d+s` silently
+  // stopped matching the moment a turn passed sixty seconds, so EVERY turn
+  // longer than a minute read as `idle`. dex was three and a half minutes
+  // into a live turn ("Lollygagging… (3m 49s · ↓ 16.0k tokens)") and this
+  // function returned 'idle'; the task's own footer grep said BUSY. Acting
+  // on that verdict would have sent a message into a running tool call and
+  // interrupted it -- the exact damage the INTERRUPTED state documents.
+  //
+  // The tests did not catch it because every fixture was seconds-only
+  // (8s, 12s, 52s): they proved the branch that already worked. The
+  // minute-scale fixtures now live beside them, both directions.
+  /\((?:\s*\d+h)?(?:\s*\d+m)?\s*\d+s\s*·\s*↓\s*\d/,
   // Known spinner labels paired with the turn-scoped `(Ns · ↓` tail on
   // the same line. The tail requirement kills the "Thinking…" prose
   // false positive. Non-exhaustive by design; the bare tokens pattern
-  // above is the authoritative fallback.
-  /\b(?:Combobulating|Beaming|Thinking|Pondering|Reticulating|Configuring|Noodling|Ruminating|Percolating|Cogitating|Deliberating|Contemplating|Musing|Brewing|Synthesizing|Distilling|Refining|Simmering|Crafting|Formulating|Consulting|Unfurling|Unspooling|Unraveling)…\s*\(\s*\d+s\s*·\s*↓/,
+  // above is the authoritative fallback -- which is why the bare pattern
+  // must carry the minute form too (it is the one that has to hold when
+  // the label is a gerund nobody listed, e.g. "Lollygagging").
+  /\b(?:Combobulating|Beaming|Thinking|Pondering|Reticulating|Configuring|Noodling|Ruminating|Percolating|Cogitating|Deliberating|Contemplating|Musing|Brewing|Synthesizing|Distilling|Refining|Simmering|Crafting|Formulating|Consulting|Unfurling|Unspooling|Unraveling)…\s*\((?:\s*\d+h)?(?:\s*\d+m)?\s*\d+s\s*·\s*↓/,
 ]
 
 // `esc to interrupt` is a footer-region-only busy signal: Claude Code
